@@ -658,5 +658,3 @@ Option 3: Dynamic Discovery
 - ✅ Scales automatically: More entities → longer intervals
 - ✅ No throttling risk: Always within safe bounds
 - ✅ Easy to reason about: Clear cause and effect
-- Related design documents for other Sources
--->
