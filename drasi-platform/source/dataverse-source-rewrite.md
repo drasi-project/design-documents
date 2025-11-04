@@ -179,11 +179,33 @@ N/A
 
 **Research Findings**
 
-**Dataverse Service Protection API Limits:**
-- **6,000 requests per 5-minute sliding window** (1,200 requests/minute max). Users are unable to pay for higher limits. These limits aren't related to entitlement limits (e.g., number of API calls based on license type).
+**Dataverse API Limits Overview:**
+
+Dataverse enforces two separate API limit systems:
+
+**1. Short-term Service Protection Limits (Per Principal, 5-Minute Window):**
+- **6,000 requests per 300 seconds (5 minutes)** - equivalent to 1,200 requests/minute maximum
 - **20 minutes of execution time** per 5-minute window
 - **52 concurrent requests** maximum
-- Automatic retry with `Retry-After` header on 429 responses
+- **Scope**: Applies per Managed Identity (or user) in each environment
+- **Behavior**: Each Managed Identity gets its own independent 6,000-request bucket
+- **Throttling**: Automatic retry with `Retry-After` header on 429 responses
+- **Note**: These limits cannot be increased through purchase
+
+**2. 24-Hour Request Entitlement (Tenant-Wide Pool):**
+- **Licensed users**: 40,000 requests per day per user
+- **Managed Identities/Service Principals**: Do NOT have individual 40,000 request limits
+- **Tenant pool**: All non-licensed principals (MIs, service principals, application users) draw from a shared tenant-wide pool
+- **Pool calculation**: 25,000 base + 5,000 × (number of unique paid licensed users), capped at 10,000,000
+- **Reporting**: Power Platform Admin Center → Analytics → Capacity shows combined daily usage
+- **Throttling**: When pool exhausted, all principals receive 429 Too Many Requests (after 6-month grace period)
+- **Add-ons**: 50,000-request capacity add-ons available for purchase to expand the pool
+
+**Impact for Drasi with Managed Identity:**
+- Each Managed Identity has dedicated 6,000 req/5-min protection limits (not shared)
+- All Managed Identities share the tenant-wide 24-hour pool
+
+
 
 **Change Tracking API Characteristics:**
 - Each API call tracks **only one table/entity**
@@ -191,6 +213,9 @@ N/A
 - Delta tokens expire after **7 days** (configurable via `ExpireChangeTrackingInDays`). This does not affect us as we are storing the delta token in the dapr state store.
 
 **Rate Limit Analysis:**
+
+**Short-term (5-minute) Protection Limits:**
+
 With current 60-second interval and single entity:
 - 5 requests per 5-minute window
 - Far below the 6,000 request limit (<0.1%)
@@ -198,13 +223,18 @@ With current 60-second interval and single entity:
 With multiple entities, the formula scales:
 - **Polling Interval = Entity Count / 10** (using 50% safety margin of 6,000 limit)
 
-| Entities | Safe Interval | Requests per 5-min |
-|----------|---------------|-------------------|
-| 5        | 0.5s          | 3,000             |
-| 10       | 1s            | 3,000             |
-| 50       | 5s            | 3,000             |
-| 100      | 10s           | 3,000             |
-| 500      | 50s           | 3,000             |
+| Entities | Safe Interval | Requests per 5-min | % of 5-min Limit |
+|----------|---------------|-------------------|------------------|
+| 5        | 0.5s          | 3,000             | 50%              |
+| 10       | 1s            | 3,000             | 50%              |
+| 50       | 5s            | 3,000             | 50%              |
+| 100      | 10s           | 3,000             | 50%              |
+| 500      | 50s           | 3,000             | 50%              |
+
+- **Short-term (5-min) limits are NOT the constraint** - they're easily satisfied
+- **24-hour tenant pool IS the constraint** - requires careful capacity planning
+- Default polling interval should be **conservative** (e.g., 30-60 seconds) to avoid exhausting tenant pools
+- Adaptive polling helps by slowing down during idle periods
 
 **Why Webhooks Won't Work:**
 
@@ -333,11 +363,13 @@ When `attribute.Value` is an `EntityReference`, `JsonSerializer.SerializeToNode(
 
 **Design Decision:**
 
-✅ **Simple lookups are fully supported.** The current implementation correctly serializes `EntityReference` objects with `Id`, `LogicalName`, and `Name` properties.
+✅ **Simple lookups are fully supported.** The current implementation correctly serializes `EntityReference` objects with `Id`, `LogicalName`, and `Name` properties. We will serialize the lookup fields as-is without modification. 
 
-**Recommended Approach - Use Drasi Middleware:**
+Depending on the use case, there are multiple ways that users can use the lookup field data in their continuous queries. For example:
 
-Instead of modifying the source code, users can leverage **Drasi's `promote` middleware** to extract lookup field properties to the top level for easier querying:
+##### Use Drasi Middleware:
+
+Users can leverage **Drasi's `promote` middleware** to extract lookup field properties to the top level for easier querying:
 
 ```yaml
 apiVersion: v1
@@ -380,12 +412,14 @@ Into flattened properties:
 }
 ```
 
+
 **Benefits of this approach:**
-- ✅ No source code changes required
-- ✅ User-configurable per continuous query
-- ✅ Preserves original nested data for other queries
-- ✅ Standard Drasi pattern for data transformation
-- ✅ Standard Drasi pattern for data transformation
+- No source code changes required
+- User-configurable per continuous query
+- Preserves original nested data for other queries
+- Standard Drasi pattern for data transformation
+- In case if the user has multiple Drasi Dataverse sources monitoring different tables, they can create relationships in their queries by matching on the lookup IDs.
+
 
 
 ### API Design
@@ -540,12 +574,26 @@ Don't forget:
 
 ### Research Notes
 
-**Service Protection API Limits (Per User, 5-Minute Sliding Window):**
-- 6,000 requests per 5-minute window (= 1,200 requests/minute max)
-- 20 minutes (1,200 seconds) of execution time per 5-minute window
-- 52 concurrent requests maximum
+**Service Protection API Limits (Per Principal, 5-Minute Sliding Window):**
+- **6,000 requests per 5-minute window** (= 1,200 requests/minute max)
+- **20 minutes (1,200 seconds) of execution time** per 5-minute window
+- **52 concurrent requests** maximum
+- **Scope**: Per Managed Identity or user in each environment
+- Each principal gets independent limit bucket
 - Automatic retry with Retry-After header on 429 responses
 - Only one table is tracked per retrieve changes API call
+
+**24-Hour Request Entitlement (Tenant-Wide Pool):**
+
+| Aspect | Detail |
+|--------|--------|
+| **Scope** | Tenant-wide pool for all non-licensed principals (service principals, managed identities, application users) |
+| **Managed Identity behavior** | Does not have a personal 40,000 limit because it isn't a licensed user. Every request subtracts from tenant's pooled capacity |
+| **Typical pool size** | 25,000 base + 5,000 × (number of unique paid licensed users) → capped at 10,000,000 |
+| **Reporting** | Power Platform Admin Center → Analytics → Capacity shows combined daily usage of all MIs + service principals |
+| **Throttling** | When pool exhausted, every principal (including MI) receives 429 Too Many Requests after 6-month grace period |
+| **Add-ons** | Can purchase 50,000-request add-ons to expand pool |
+| **Licensed users** | Each gets personal 40,000 requests/day (not from shared pool) |
 
 **Impact of Smaller Intervals:**
 
