@@ -87,7 +87,7 @@ These updates will make the Dataverse Source more secure, efficient, and easier 
 
 **Drasi .NET Source SDK**:
 - The current .NET Source SDK must support all required functionality for Dataverse integration
-- If the SDK lacks necessary features (e.g., specific authentication patterns), it must be extended
+- If the SDK lacks necessary features, it must be extended
 
 **Azure Identity Libraries**:
 - Requires Azure.Identity NuGet package for managed identity support
@@ -95,11 +95,15 @@ These updates will make the Dataverse Source more secure, efficient, and easier 
 
 **Dataverse SDK**:
 - Microsoft.PowerPlatform.Dataverse.Client or equivalent for Dataverse API access
-- Must support both managed identity and service principal authentication
+- Must support managed identity and environment variable-based authentication
+
+**Dapr**:
+- Requires Dapr state store for persisting change tracking tokens
+- State store name: `drasi-state`
 
 **Control Plane**:
-- Configuration schema changes for authentication options may require control plane updates
-- Resource provider should support deploying sources with managed identity configuration
+- Configuration schema changes for identity field structure
+- Resource provider should support deploying sources with identity configuration
 
 **Build and Release Pipelines**:
 - GitHub Actions workflows are already configured to build and publish the Dataverse source
@@ -135,8 +139,9 @@ The updated Dataverse Source will consist of two main components, both refactore
 Both components will share common authentication and configuration logic through the SDK.
 
 **Key Improvements**:
-- **Change Tracking with Adaptive Polling**: Leverages Dataverse's built-in change tracking to retrieve only changed records, combined with two-phase adaptive polling (slow increase below threshold, fast increase above) to reduce API overhead during quiet periods
-- **Managed Identity**: Leverages Azure managed identity (MicrosoftEntraWorkloadID) when running in Azure, eliminating credential storage
+- **Change Tracking with Adaptive Polling**: Leverages Dataverse's built-in change tracking to retrieve only changed records, with automatic polling interval calculation based on entity count (user can override with maxInterval)
+- **Persistent State**: Uses Dapr state store to persist change tracking tokens, ensuring reliability across restarts
+- **Flexible Authentication**: Supports managed identity (MicrosoftEntraWorkloadID) or environment variables for credentials (stored as Kubernetes secrets)
 - **SDK-based Architecture**: Common patterns for configuration, logging, and telemetry provided by the SDK
 
 ### Architecture Diagram
@@ -225,9 +230,30 @@ public class ManagedIdentityAuthProvider : IDataverseAuthProvider
     }
 }
 
-public class ServicePrincipalAuthProvider : IDataverseAuthProvider
+public class EnvironmentVariableAuthProvider : IDataverseAuthProvider
 {
-    // Existing implementation for backward compatibility
+    private readonly string _instanceUrl;
+    
+    public EnvironmentVariableAuthProvider(string instanceUrl)
+    {
+        _instanceUrl = instanceUrl;
+    }
+    
+    public async Task<ServiceClient> GetAuthenticatedClientAsync()
+    {
+        // Read from environment variables (can be set from Kubernetes secrets)
+        var clientId = Environment.GetEnvironmentVariable("DATAVERSE_CLIENT_ID");
+        var tenantId = Environment.GetEnvironmentVariable("DATAVERSE_TENANT_ID");
+        var clientSecret = Environment.GetEnvironmentVariable("DATAVERSE_CLIENT_SECRET");
+        
+        var credential = new ClientSecretCredential(tenantId, clientId, clientSecret);
+        var token = await credential.GetTokenAsync(
+            new TokenRequestContext(new[] { $"{_instanceUrl}/.default" }));
+        
+        return new ServiceClient(
+            instanceUri: new Uri(_instanceUrl),
+            tokenProviderFunction: async (uri) => token.Token);
+    }
 }
 ```
 
@@ -239,40 +265,32 @@ apiVersion: v1
 name: my-dataverse
 spec:
   kind: Dataverse
+  identity:
+    type: MicrosoftEntraWorkloadID
+    # Optional: specify client ID for user-assigned managed identity
+    clientId: "optional-client-id"
   properties:
     instanceUrl: https://myorg.crm.dynamics.com
     
-    # Option 1: Managed Identity (preferred) - uses MicrosoftEntraWorkloadID type
-    authentication:
-      type: MicrosoftEntraWorkloadID
-      # Optional: specify client ID for user-assigned managed identity
-      clientId: "optional-client-id"
-    
-    # Option 2: Service Principal (fallback)
-    # authentication:
-    #   type: ServicePrincipal
-    #   clientId: "app-client-id"
-    #   clientSecret: "app-secret"
-    #   tenantId: "tenant-id"
-    
     # Polling configuration
     polling:
-      initialInterval: 5s
-      minInterval: 5s
-      maxInterval: 300s
-      threshold: 60s        # Switch between slow and fast multipliers
-      slowMultiplier: 1.3   # Increase slowly below threshold
-      fastMultiplier: 2.0   # Increase faster above threshold
+      maxInterval: 300s  # Optional: maximum polling interval (calculated based on entity count if not specified)
     
     # Tables to monitor
     tables:
       - name: account
       - name: contact
+
+# Alternative: Using environment variables for authentication (no identity section needed)
+# Set these as environment variables or Kubernetes secrets:
+#   DATAVERSE_CLIENT_ID
+#   DATAVERSE_TENANT_ID
+#   DATAVERSE_CLIENT_SECRET (use secrets for sensitive values)
 ```
 
 #### 2. Adaptive Polling Algorithm
 
-The adaptive polling algorithm balances responsiveness with API efficiency by adjusting the polling interval based on change detection patterns. It uses a two-phase multiplicative approach: slower growth for shorter intervals and faster growth for longer intervals, providing a balance between quick responsiveness and reduced API calls during extended quiet periods.
+The adaptive polling algorithm balances responsiveness with API efficiency by adjusting the polling interval based on change detection patterns. The algorithm automatically calculates optimal polling intervals based on the number of entities being tracked, with a configurable maximum to allow user override.
 
 **Polling State Machine**:
 ```csharp
@@ -281,19 +299,29 @@ public class AdaptivePollingController
     private TimeSpan _currentInterval;
     private readonly TimeSpan _minInterval;
     private readonly TimeSpan _maxInterval;
-    private readonly TimeSpan _threshold;
-    private readonly double _slowMultiplier;  // e.g., 1.2x-1.5x
-    private readonly double _fastMultiplier;  // e.g., 2.0x
-    private DateTime _lastChangeDetected;
+    private readonly int _entityCount;
     
-    public AdaptivePollingController(PollingConfig config)
+    public AdaptivePollingController(int entityCount, TimeSpan? userMaxInterval = null)
     {
-        _minInterval = config.MinInterval;
-        _maxInterval = config.MaxInterval;
-        _threshold = config.Threshold;
-        _slowMultiplier = config.SlowMultiplier;
-        _fastMultiplier = config.FastMultiplier;
-        _currentInterval = config.InitialInterval;
+        _entityCount = entityCount;
+        _minInterval = TimeSpan.FromSeconds(5);
+        
+        // Calculate max interval based on entity count, or use user override
+        _maxInterval = userMaxInterval ?? CalculateMaxInterval(entityCount);
+        _currentInterval = _minInterval;
+    }
+    
+    private TimeSpan CalculateMaxInterval(int entityCount)
+    {
+        // Algorithm: scale max interval based on entity count
+        // More entities = shorter max interval to ensure timely detection
+        // Fewer entities = longer max interval to reduce API calls
+        if (entityCount <= 10)
+            return TimeSpan.FromMinutes(10);
+        else if (entityCount <= 50)
+            return TimeSpan.FromMinutes(5);
+        else
+            return TimeSpan.FromMinutes(2);
     }
     
     public TimeSpan GetNextInterval(bool changesDetected)
@@ -302,18 +330,13 @@ public class AdaptivePollingController
         {
             // Reset to minimum interval on change detection
             _currentInterval = _minInterval;
-            _lastChangeDetected = DateTime.UtcNow;
         }
         else
         {
-            // Two-phase multiplicative increase
-            double multiplier = _currentInterval < _threshold 
-                ? _slowMultiplier  // Below threshold: increase slowly (e.g., 1.2x-1.5x)
-                : _fastMultiplier; // Above threshold: increase faster (e.g., 2.0x)
-            
+            // Gradually increase interval up to max
             _currentInterval = TimeSpan.FromSeconds(
                 Math.Min(
-                    _currentInterval.TotalSeconds * multiplier,
+                    _currentInterval.TotalSeconds * 1.5,  // 50% increase
                     _maxInterval.TotalSeconds
                 )
             );
@@ -331,7 +354,7 @@ public class AdaptivePollingController
    - Update change token
    - Reset polling interval to minimum
 3. If no changes:
-   - Increase polling interval using two-phase multiplier (slow below threshold, fast above)
+   - Increase polling interval gradually (1.5x multiplier)
    - Wait for next interval
 
 #### 3. SDK Integration
@@ -436,6 +459,31 @@ await proxy.StartAsync();
 
 #### 4. Complex Data Type Handling
 
+**Incoming Dataverse Entity Structure**:
+
+Dataverse entities returned from the API have the following structure:
+```json
+{
+  "accountid": "00000000-0000-0000-0000-000000000001",
+  "name": "Contoso Corp",
+  "revenue": {
+    "Value": 1000000.00  // Money type
+  },
+  "primarycontactid": {  // Lookup type (EntityReference)
+    "Id": "00000000-0000-0000-0000-000000000002",
+    "LogicalName": "contact",
+    "Name": "John Doe"
+  },
+  "industrycode": {  // Choice/OptionSetValue
+    "Value": 1
+  },
+  "accountcategorycode": [  // Multi-select choice (OptionSetValueCollection)
+    { "Value": 1 },
+    { "Value": 2 }
+  ]
+}
+```
+
 **Data Type Value Extraction**:
 ```csharp
 public class DataTypeValueExtractor
@@ -495,22 +543,30 @@ public class DataTypeValueExtractor
 public class DataverseChangeTracker
 {
     private readonly ServiceClient _client;
-    private Dictionary<string, string> _tableVersions = new();
+    private readonly DaprClient _daprClient;
+    private const string STATE_STORE_NAME = "drasi-state";
     
     public async Task<ChangeSet> RetrieveChangesAsync(string tableName)
     {
+        // Retrieve data version token from Dapr state store
+        var stateKey = $"dataverse-token-{tableName}";
+        var dataVersion = await _daprClient.GetStateAsync<string>(STATE_STORE_NAME, stateKey);
+        
         // Use Dataverse's RetrieveEntityChanges API
         var request = new RetrieveEntityChangesRequest
         {
             EntityName = tableName,
             Columns = new ColumnSet(allColumns: true),
-            DataVersion = _tableVersions.GetValueOrDefault(tableName)
+            DataVersion = dataVersion
         };
         
         var response = (RetrieveEntityChangesResponse)await _client.ExecuteAsync(request);
         
-        // Update version token for next retrieval
-        _tableVersions[tableName] = response.EntityChanges.DataToken;
+        // Persist version token to Dapr state store for next retrieval
+        await _daprClient.SaveStateAsync(
+            STATE_STORE_NAME, 
+            stateKey, 
+            response.EntityChanges.DataToken);
         
         var changeSet = new ChangeSet
         {
@@ -530,33 +586,20 @@ public class DataverseChangeTracker
         
         return changeSet;
     }
-    
-    public bool IsChangeTrackingEnabled(string tableName)
-    {
-        // Query entity metadata to verify change tracking is enabled
-        var request = new RetrieveEntityRequest
-        {
-            LogicalName = tableName,
-            EntityFilters = EntityFilters.Entity
-        };
-        
-        var response = (RetrieveEntityResponse)_client.Execute(request);
-        return response.EntityMetadata.ChangeTrackingEnabled ?? false;
-    }
 }
 ```
 
 #### Advantages of this design
-- **Security**: Managed identity eliminates credential storage and rotation concerns
-- **Performance**: Dataverse change tracking combined with two-phase adaptive polling significantly reduces API calls during quiet periods while maintaining responsiveness
+- **Security**: Managed identity eliminates credential storage and rotation concerns; environment variables can use Kubernetes secrets
+- **Performance**: Dataverse change tracking combined with adaptive polling significantly reduces API calls during quiet periods while maintaining responsiveness
 - **Accuracy**: Native change tracking ensures no changes are missed and deleted records are properly detected
-- **Maintainability**: SDK integration ensures consistency with other sources and reduces code duplication
+- **Maintainability**: SDK integration ensures consistency with other sources and reduces code duplication; Dapr state store provides reliable token persistence
 - **Extensibility**: Data type extraction pattern can be easily extended to support additional Dataverse types
-- **Flexibility**: Two-phase polling algorithm balances responsiveness at short intervals with efficiency at longer intervals
+- **Simplicity**: Automatic calculation of polling intervals based on entity count reduces configuration complexity
 
 #### Disadvantages
 - **Complexity**: Adaptive polling and change tracking add state management complexity
-- **Azure Dependency**: Managed identity works best in Azure environments (though service principal remains available)
+- **Dapr Dependency**: Requires Dapr state store for token persistence
 - **Migration**: Existing deployments will need configuration updates
 - **Change Tracking Setup**: Requires change tracking to be enabled on Dataverse tables (must be configured by administrators)
 - **Testing**: Adaptive polling and change tracking behavior requires comprehensive testing across different change patterns
@@ -565,29 +608,27 @@ public class DataverseChangeTracker
 
 **Configuration API Changes**:
 
-The source configuration schema will be extended to support authentication options. Note that `MicrosoftEntraWorkloadID` is already a supported authentication type in Drasi, so managed identity can be configured using that type.
+The source configuration schema uses the `identity` field (at the same level as `kind` and `properties`) for authentication. Managed identity can be configured using the `MicrosoftEntraWorkloadID` type, or credentials can be provided via environment variables for scenarios where secrets are stored in Kubernetes.
 
 ```yaml
-# Authentication section
-authentication:
-  type: MicrosoftEntraWorkloadID | ServicePrincipal
-  
-  # For MicrosoftEntraWorkloadID (Managed Identity)
+# Identity section (at same level as kind and properties)
+identity:
+  type: MicrosoftEntraWorkloadID
   clientId?: string  # Optional: user-assigned managed identity
-  
-  # For ServicePrincipal (existing)
-  clientId?: string
-  clientSecret?: string
-  tenantId?: string
 
-# Polling configuration section
+# Polling configuration section (under properties)
 polling:
-  initialInterval: duration    # e.g., "5s", "1m"
-  minInterval: duration         # Minimum polling interval
-  maxInterval: duration         # Maximum polling interval
-  threshold: duration           # Threshold for switching multipliers
-  slowMultiplier: number        # Multiplier below threshold (e.g., 1.3)
-  fastMultiplier: number        # Multiplier above threshold (e.g., 2.0)
+  maxInterval: duration  # Optional: maximum polling interval
+                         # If not specified, calculated based on entity count:
+                         # - <= 10 entities: 10 minutes
+                         # - <= 50 entities: 5 minutes  
+                         # - > 50 entities: 2 minutes
+
+# Environment variables option (no identity section needed)
+# These can be set as Kubernetes secrets:
+#   DATAVERSE_CLIENT_ID
+#   DATAVERSE_TENANT_ID
+#   DATAVERSE_CLIENT_SECRET
 ```
 
 **CLI Impact**:
@@ -893,7 +934,7 @@ spec:
     tenantId: xxxxx
 ```
 
-**New Configuration**:
+**New Configuration (using environment variables)**:
 ```yaml
 kind: Source
 name: my-dataverse
@@ -901,18 +942,27 @@ spec:
   kind: Dataverse
   properties:
     instanceUrl: https://myorg.crm.dynamics.com
-    authentication:
-      type: ServicePrincipal
-      clientId: xxxxx
-      clientSecret: xxxxx
-      tenantId: xxxxx
     polling:
-      initialInterval: 30s
-      minInterval: 5s
-      maxInterval: 300s
-      threshold: 60s
-      slowMultiplier: 1.3
-      fastMultiplier: 2.0
+      maxInterval: 300s  # Optional
+
+# Set these as Kubernetes secrets:
+# DATAVERSE_CLIENT_ID=xxxxx
+# DATAVERSE_CLIENT_SECRET=xxxxx
+# DATAVERSE_TENANT_ID=xxxxx
+```
+
+**New Configuration (using managed identity)**:
+```yaml
+kind: Source
+name: my-dataverse
+spec:
+  kind: Dataverse
+  identity:
+    type: MicrosoftEntraWorkloadID
+  properties:
+    instanceUrl: https://myorg.crm.dynamics.com
+    polling:
+      maxInterval: 300s  # Optional
 ```
 
 ## References
