@@ -282,7 +282,7 @@ The design introduces a trait-based identity provider pattern with three key com
 │  ─────────────────     │  ─────────────    │  ──────────────────    │
 │  credentials =         │  credentials =    │  credentials =         │
 │    provider            │    provider       │    provider            │
-│    .get_credentials()  │    .get_creds()   │    .get_credentials()  │
+│    .get_credentials()  │    .get_credentials()   │    .get_credentials()  │
 │    .await?;            │    .await?;       │    .await?;            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -360,20 +360,51 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 /// Trait for identity providers that supply authentication credentials.
-/// 
-/// Implementations must be thread-safe (`Send + Sync`) and cloneable.
+///
+/// Implementations must be thread-safe (`Send + Sync`). To use them as
+/// cloneable trait objects (e.g. `Box<dyn IdentityProvider>` or
+/// `Arc<dyn IdentityProvider>`), concrete types should also implement
+/// `Clone`; cloning of the trait object is then provided via a helper trait
+/// and the `Clone` impl for `Box<dyn IdentityProvider + Send + Sync>`.
 #[async_trait]
 pub trait IdentityProvider: Send + Sync {
     /// Fetch credentials for authentication.
-    /// 
+    ///
     /// This method may perform network calls to retrieve tokens
     /// and should be called close to the point of use.
     async fn get_credentials(&self) -> Result<Credentials>;
-    
-    /// Clone the provider into a boxed trait object.
-    fn clone_box(&self) -> Box<dyn IdentityProvider>;
 }
 
+/// Helper trait to enable cloning of `Box<dyn IdentityProvider>` trait objects.
+///
+/// This is implemented automatically for any `'static` type that implements
+/// both `IdentityProvider` and `Clone`.
+pub trait IdentityProviderClone {
+    fn clone_box(&self) -> Box<dyn IdentityProvider + Send + Sync>;
+}
+
+impl<T> IdentityProviderClone for T
+where
+    T: 'static + IdentityProvider + Clone,
+{
+    fn clone_box(&self) -> Box<dyn IdentityProvider + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+impl Clone for Box<dyn IdentityProvider + Send + Sync> {
+    fn clone(&self) -> Self {
+        // Delegate to the `IdentityProviderClone` implementation for the
+        // underlying concrete type.
+        self.as_ref().clone_box()
+    }
+}
+
+/// Shared, cloneable handle to an identity provider implementation.
+///
+/// In most places, Drasi components should depend on this alias rather than
+/// holding a concrete implementation type directly.
+pub type SharedIdentityProvider = Arc<dyn IdentityProvider + Send + Sync>;
 /// Credentials returned by an identity provider.
 #[derive(Debug, Clone)]
 pub enum Credentials {
