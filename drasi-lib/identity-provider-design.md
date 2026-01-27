@@ -218,19 +218,6 @@ let onprem_reaction = PostgresStoredProcReaction::builder("onprem-legacy")
 4. **Error Handling** - Clear error messages for authentication failures
 5. **Testability** - Design must support mocking for unit tests without real cloud credentials
 
-### Dependencies
-
-| Dependency | Purpose | Version |
-|------------|---------|---------|
-| `async-trait` | Async trait support | 0.1+ |
-| `azure_identity` | Azure AD authentication (optional) | 0.20+ |
-| `azure_core` | Azure SDK core types (optional) | 0.20+ |
-| `aws-config` | AWS configuration loading (optional) | 1.0+ |
-| `aws-sdk-rds` | RDS IAM token generation (optional) | 1.0+ |
-
-**Component Dependencies:**
-- This feature will be implemented in `drasi-core` library
-- Integration required for: PostgreSQL Reaction, PostgreSQL Source, MySQL Reaction, HTTP Reaction
 
 ### Out of scope
 
