@@ -33,7 +33,7 @@ An IoT engineer deploys a Drasi continuous query and wants every result change t
 
 1. Add an MQTT Reaction for drasi-core that subscribes to queries and emits result changes to MQTT brokers.
 2. Configurable MQTTCallSpec (topic - QoS - retain) based on per query and operation.
-3. Support MQTT v3.1.1 as the primary protocol version, this achieves (maximum compatibility) as it understands MQTT v3.1.1 brokers and interoperable with MQTT v5 brokers.
+3. Support MQTT v5 and v3.1.1 (fallback option).
 4. Validate interoperability with target brokers (Mosquitto and HiveMQ).
 
 ### Non-Goals
@@ -174,13 +174,11 @@ Template context available to use within message body templates:
 
 This approach keeps topic routing explicit and stable while still allowing per-query customization.
 
-#### 2. MQTT v3.1.1
+#### 2. MQTT v5 and v3.1.1
 
-The reaction targets **MQTT v3.1.1** as its main protocol. This version is supported by every major broker (Mosquitto, HiveMQ, AWS IoT Core, Azure IoT Hub, EMQX) and is fully interoperable with MQTT v5 brokers operating in backwards-compatibility mode. Using v3.1.1 maximizes deployment reach.
+The reaction targets **MQTT v5** and **MQTT v3.1.1** (fallback option) as main protocols. 
 
-The connection is managed by the [`rumqttc`](https://github.com/bytebeamio/rumqtt) async client, which implements MQTT v3.1.1 natively. A single long-lived `AsyncClient` is created at startup and reused for all publish calls. `rumqttc` handles reconnection.
-
-The reaction does not implement use MQTT v5 features (user properties, shared subscriptions, response topics, reason codes). If a v5-only feature is needed in the future, a dedicated v5 mode should be introduced rather than mixing protocol versions.
+The connection is managed by the [`rumqttc`](https://github.com/bytebeamio/rumqtt) async client, which implements both MQTT v3.1.1 and v5. A single long-lived `AsyncClient` is created at startup and reused for all publish calls. `rumqttc` handles reconnection.
 
 The broker connection is configured through `MqttReactionConfig`:
 
