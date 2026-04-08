@@ -718,11 +718,11 @@ pub enum MqttTransportMode {
 <!-- Optional. Describe additional information supporting this design. For instance, describe the details of alternative design if you have one. -->
 
 ## Note on Drasi Redesign & Reliability:
-This implementation acknowledges the upcoming architectural changes to the Drasi core. For V1, the MQTT Source operates on an at-most-once delivery guarantee.
+This implementation acknowledges the upcoming architectural changes to the Drasi lib. For V1, the MQTT Source operates on an at-most-once delivery guarantee.
 
 - Current Assumption: A local Write-Ahead Log (WAL) is not implemented in this iteration. This simplifies the initial scope and focuses on protocol interoperability and mapping logic.
 
-- Future Integration: Once the centralized durability framework is available in drasi-core, the MQTT Source will be integrated to support persistent state and "at-least-once" guarantees across restarts.
+- Future Integration: Once the centralized durability framework is available in drasi-lib, the MQTT Source will be integrated to support persistent state and "at-least-once" guarantees across restarts.
 
 ## References
 
