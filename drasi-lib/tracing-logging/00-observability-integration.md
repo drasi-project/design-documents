@@ -275,16 +275,23 @@ async {
 
 #### 5. Metrics Definitions
 
+**Already tracked internally** (via `PriorityQueueMetrics` atomics or `ProfilingMetadata` timestamps, but not exportable to Prometheus/OTLP — the `metrics` crate bridges them):
+
+| Metric | Type | Labels | Existing internal source |
+|--------|------|--------|--------------------------|
+| `drasi.source.events_enqueued` | Counter | `source_id` | `PriorityQueueMetrics.total_enqueued` |
+| `drasi.query.processing_duration_ms` | Histogram | `query_id` | `ProfilingMetadata` per-event timestamps (sampled) |
+| `drasi.query.queue_depth` | Gauge | `query_id` | `PriorityQueueMetrics.current_depth` |
+| `drasi.reaction.dispatch_duration_ms` | Histogram | `reaction_id` | `ProfilingMetadata` per-event timestamps (sampled) |
+
+**New metrics** (not tracked anywhere today):
+
 | Metric | Type | Labels | Where Recorded |
 |--------|------|--------|----------------|
-| `drasi.source.events_received` | Counter | `source_id` | Forwarder task in `DrasiQuery::start()`, on each event received from source context channel |
-| `drasi.source.events_enqueued` | Counter | `source_id` | Forwarder task in `DrasiQuery::start()`, after `priority_queue.enqueue_wait()` |
-| `drasi.query.events_processed` | Counter | `query_id` | Event processor loop, after `process_source_change` completes successfully |
-| `drasi.query.processing_duration_ms` | Histogram | `query_id` | Event processor loop, elapsed time of `process_source_change` |
-| `drasi.query.queue_depth` | Gauge | `query_id` | `PriorityQueue` on enqueue/dequeue |
+| `drasi.source.events_received` | Counter | `source_id` | Forwarder task, on each event received from source context channel |
+| `drasi.query.events_processed` | Counter | `query_id` | Event processor loop, after successful `process_source_change` |
 | `drasi.query.errors` | Counter | `query_id`, `error_type` | Event processor loop, on `process_source_change` error |
 | `drasi.reaction.events_dispatched` | Counter | `reaction_id`, `query_id` | `dispatch_query_results()`, per dispatcher call |
-| `drasi.reaction.dispatch_duration_ms` | Histogram | `reaction_id` | Reaction forwarder task, elapsed time of `enqueue_query_result()` |
 | `drasi.reaction.errors` | Counter | `reaction_id`, `error_type` | Reaction forwarder task, on `enqueue_query_result()` error |
 
 #### 6. Interaction with Existing ComponentLogLayer
