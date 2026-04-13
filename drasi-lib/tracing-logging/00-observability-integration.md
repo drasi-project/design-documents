@@ -410,6 +410,12 @@ This design *is* the telemetry story for drasi-lib. After implementation, the fo
 
 4. **Span naming convention**: Should span names use dots (`query.process`) or slashes (`query/process`) or OpenTelemetry-style (`drasi.query.process`)? The current proposal uses dots. This should be consistent with whatever convention drasi-platform adopts.
 
+5. **`get_or_init_global_registry()` split**: To support Drasi Server composing `ComponentLogLayer` into its own multi-layer subscriber (with OTLP), we propose splitting `get_or_init_global_registry()` into two functions:
+   - `init_component_log_layer()` — creates the registry, channel, and worker thread, returns the `ComponentLogLayer` for the caller to compose into their own subscriber
+   - `init_default_subscriber()` — calls `init_component_log_layer()`, composes it with the `fmt` layer, and installs the global subscriber (same behavior as today)
+
+   Simple embedders call `init_default_subscriber()` and get current behavior. Drasi Server calls `init_component_log_layer()`, adds the OTLP layer alongside it, and installs its own subscriber. This is a non-breaking change.
+
 ## References
 
 - [drasi-lib crate](https://crates.io/crates/drasi-lib) — Published Rust crate

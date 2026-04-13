@@ -6,7 +6,7 @@
 
 Drasi Server is a standalone single-process deployment of Drasi that embeds `drasi-lib`. With the [drasi-lib observability design](../../drasi-lib/tracing-logging/00-observability-integration.md), drasi-lib now emits structured tracing spans and `metrics` crate counters/histograms/gauges through facade APIs — but those are no-ops until the embedding application installs a backend. This design makes Drasi Server that embedding application: it wires up the tracing subscriber and metrics recorder so that drasi-lib's telemetry flows to external backends (OTLP, Prometheus, stdout).
 
-Drasi Server does not manage or run telemetry backends for the user. It connects to user-provided endpoints — the user is responsible for running their own Jaeger, Prometheus, or OTLP collector.
+Drasi Server does not manage or run telemetry backends for the user. It exports traces via OTLP (OpenTelemetry Protocol), which is accepted by most observability tools — Jaeger, Grafana Tempo, Datadog, Honeycomb, New Relic, AWS X-Ray, Azure Monitor, and others. The user points Drasi Server at any OTLP-compatible endpoint and runs their own backend.
 
 ## Terms and Definitions
 
@@ -150,94 +150,28 @@ When the `telemetry` section is omitted, Drasi Server behaves exactly as today �
 
 #### 2. Tracing Subscriber Setup
 
-On startup, Drasi Server composes a multi-layer tracing subscriber:
+On startup, Drasi Server composes a multi-layer tracing subscriber with three layers:
 
-```rust
-fn init_tracing(config: &DrasiServerConfig) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&config.log_level));
+1. **ComponentLogLayer** (from drasi-lib) — routes log events to per-component streams, unchanged
+2. **fmt layer** — writes structured logs to stdout, filtered by `logLevel`
+3. **OTLP layer** (optional) — exports spans to the user-provided OTLP endpoint via `tracing-opentelemetry`. Only created when `telemetry.tracing.endpoint` is configured.
 
-    let fmt_layer = tracing_subscriber::fmt::layer().with_filter(filter);
-    let component_layer = get_component_log_layer();
-
-    // Only create OTLP layer if endpoint is configured
-    let otel_layer = config.telemetry.as_ref()
-        .and_then(|t| t.tracing.as_ref())
-        .and_then(|t| t.endpoint.as_ref())
-        .filter(|ep| !ep.is_empty())
-        .map(|endpoint| {
-            let tracer = opentelemetry_otlp::new_pipeline()
-                .tracing()
-                .with_exporter(
-                    opentelemetry_otlp::new_exporter().tonic().with_endpoint(endpoint),
-                )
-                .with_trace_config(
-                    opentelemetry_sdk::trace::config()
-                        .with_resource(Resource::new(vec![
-                            KeyValue::new("service.name",
-                                config.telemetry.as_ref()
-                                    .and_then(|t| t.tracing.as_ref())
-                                    .and_then(|t| t.service_name.clone())
-                                    .unwrap_or_else(|| "drasi-server".to_string())),
-                        ])),
-                )
-                .install_batch(opentelemetry_sdk::runtime::Tokio)
-                .expect("Failed to initialize OTLP tracer");
-
-            tracing_opentelemetry::layer().with_tracer(tracer)
-        });
-
-    Registry::default()
-        .with(component_layer)
-        .with(fmt_layer)
-        .with(otel_layer)
-        .init();
-}
-```
+If no OTLP endpoint is configured, only layers 1 and 2 are active — identical to current behavior.
 
 #### 3. Metrics Recorder Setup
 
-```rust
-fn init_metrics(config: &DrasiServerConfig) {
-    let metrics_config = match config.telemetry.as_ref().and_then(|t| t.metrics.as_ref()) {
-        Some(m) => m,
-        None => return, // No config → no recorder → metrics calls are no-ops
-    };
+On startup, Drasi Server installs a metrics recorder based on the `telemetry.metrics.backend` config:
 
-    match metrics_config.backend.as_deref() {
-        Some("prometheus") | None => {
-            let port = metrics_config.prometheus.as_ref()
-                .and_then(|p| p.port)
-                .unwrap_or(9090);
-
-            metrics_exporter_prometheus::PrometheusBuilder::new()
-                .with_http_listener(([0, 0, 0, 0], port))
-                .install()
-                .expect("Failed to install Prometheus recorder");
-
-            log::info!("Prometheus metrics endpoint on port {}", port);
-        }
-        Some("otlp") => {
-            let endpoint = metrics_config.otlp.as_ref()
-                .and_then(|o| o.endpoint.as_ref())
-                .expect("OTLP metrics endpoint required when backend=otlp");
-
-            // Install OTLP metrics push exporter
-            log::info!("OTLP metrics export to {}", endpoint);
-        }
-        Some(other) => {
-            log::warn!("Unknown metrics backend '{}', metrics disabled", other);
-        }
-    }
-}
-```
+- **`prometheus`** — starts an HTTP listener on the configured port exposing a `/metrics` scrape endpoint
+- **`otlp`** — pushes metrics to the configured OTLP endpoint at a configurable interval
+- **Not configured** — no recorder installed, `metrics` facade calls are no-ops
 
 #### 4. Startup Order
 
 ```
 1. Load config (existing)
-2. init_tracing(config)          ← NEW
-3. init_metrics(config)          ← NEW
+2. Build and install tracing subscriber (NEW)
+3. Install metrics recorder (NEW)
 4. get_or_init_global_registry() (existing)
 5. Build and start DrasiLib instances (existing)
 6. Start Axum API server (existing)
@@ -245,14 +179,13 @@ fn init_metrics(config: &DrasiServerConfig) {
 
 #### 5. Shutdown
 
-On graceful shutdown (SIGTERM/SIGINT), flush pending telemetry:
+On graceful shutdown (SIGTERM/SIGINT), Drasi Server flushes any pending traces/metrics before exiting.
 
-```rust
-opentelemetry::global::shutdown_tracer_provider();
-// Prometheus recorder is dropped automatically
-```
-
-> **Note**: The interaction between `init_tracing` and `get_or_init_global_registry()` needs care. Currently `get_or_init_global_registry()` sets the global subscriber. With this design, Drasi Server sets the global subscriber first (with ComponentLogLayer composed in), so `get_or_init_global_registry()` may need to be refactored to return the layer rather than installing the subscriber itself.
+> **Note**: To compose `ComponentLogLayer` into Drasi Server's subscriber alongside the OTLP layer, drasi-lib's `get_or_init_global_registry()` will be split into two functions (see [drasi-lib design doc, Open Issue #5](../../drasi-lib/tracing-logging/00-observability-integration.md)):
+> - `init_component_log_layer()` — returns the layer for Drasi Server to compose
+> - `init_default_subscriber()` — current behavior for simple embedders
+>
+> Drasi Server calls `init_component_log_layer()` and composes the returned layer with fmt + OTLP into its own subscriber.
 
 ### API Design
 
@@ -318,13 +251,9 @@ Always export to OTLP, require users to run an OpenTelemetry Collector to fan ou
 
 ## Open Issues
 
-1. **`get_or_init_global_registry()` refactor**: This function currently installs the global subscriber. Drasi Server needs to compose `ComponentLogLayer` into its own subscriber. Should `get_or_init_global_registry()` be changed to return the layer, or should Drasi Server bypass it and construct the `ComponentLogLayer` directly?
+1. **Metrics port conflict**: If the Prometheus metrics port conflicts with the Drasi Server API port, should we serve `/metrics` on the same Axum server instead of a separate listener?
 
-2. **Metrics port conflict**: If the Prometheus metrics port conflicts with the Drasi Server API port, should we serve `/metrics` on the same Axum server instead of a separate listener?
-
-3. **Trace sampling**: For high-throughput deployments, should the config support a sampling rate (e.g., `samplingRate: 0.1` to export 10% of traces)?
-
-4. **Multiple metrics backends**: The `metrics` crate only supports one global recorder. If a user wants both Prometheus scrape and OTLP push simultaneously, we'd need `metrics-fanout`. Is this a requirement, or is one-backend-at-a-time sufficient?
+2. **Trace sampling**: For high-throughput deployments, should the config support a sampling rate (e.g., `samplingRate: 0.1` to export 10% of traces)?
 
 ## References
 
