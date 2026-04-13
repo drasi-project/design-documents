@@ -1,19 +1,18 @@
 # Tracing / Logging / Metrics Integration for Drasi Server
 
-* Project Drasi - April 10, 2026 - Ruokun Niu (@ruokun-niu)
+* Project Drasi - April 12, 2026 - Ruokun Niu (@ruokun-niu)
 
 ## Overview
 
 Drasi Server is a standalone single-process deployment of Drasi that embeds `drasi-lib`. With the [drasi-lib observability design](../../drasi-lib/tracing-logging/00-observability-integration.md), drasi-lib now emits structured tracing spans and `metrics` crate counters/histograms/gauges through facade APIs — but those are no-ops until the embedding application installs a backend. This design makes Drasi Server that embedding application: it wires up the tracing subscriber and metrics recorder so that drasi-lib's telemetry flows to external backends (OTLP, Prometheus, stdout).
 
-Drasi Server already uses a plugin architecture for sources and reactions. This design extends that same plugin model to telemetry backends, so users only install the export backends they need (e.g., OTLP, Prometheus) without bloating the base binary.
+Drasi Server does not manage or run telemetry backends for the user. It connects to user-provided endpoints — the user is responsible for running their own Jaeger, Prometheus, or OTLP collector.
 
 ## Terms and Definitions
 
 | Term | Definition |
 |------|------------|
 | OTLP | OpenTelemetry Protocol — a standard for exporting traces and metrics to collectors (e.g., Jaeger, Grafana Tempo, Prometheus via OTLP receiver). |
-| Telemetry plugin | A dynamically loaded shared library (`libdrasi_telemetry_*`) that implements the `TelemetryPluginDescriptor` trait. It installs tracing subscriber layers and/or metrics recorders when loaded. Follows the same OCI-based discovery and installation model as source and reaction plugins. |
 
 See the [drasi-lib observability design](../../drasi-lib/tracing-logging/00-observability-integration.md) for definitions of facade crate, span, subscriber, and recorder.
 
@@ -23,16 +22,16 @@ See the [drasi-lib observability design](../../drasi-lib/tracing-logging/00-obse
 
 1. **Developer running Drasi Server locally**: A developer starts Drasi Server with default config. Structured logs appear on stdout with span context. No extra setup needed.
 
-2. **Operator exporting traces to Jaeger**: An operator sets `otlp_endpoint: "http://jaeger:4317"` in the server config. Drasi Server installs a `tracing-opentelemetry` layer that exports drasi-lib's end-to-end spans (source.ingest → query.process → reaction.dispatch → reaction.receive) to Jaeger.
+2. **Operator exporting traces to Jaeger**: An operator runs Jaeger themselves and points Drasi Server at it via `telemetry.tracing.endpoint: "http://jaeger:4317"`. Drasi Server exports drasi-lib's end-to-end spans to Jaeger via OTLP.
 
-3. **Operator scraping metrics with Prometheus**: An operator enables the Prometheus scrape endpoint in config. Drasi Server installs a `metrics-exporter-prometheus` recorder and exposes `/metrics` on a configurable port. Prometheus scrapes drasi-lib's counters (events_processed, errors) and histograms (processing_duration_ms).
+3. **Operator scraping metrics with Prometheus**: An operator runs Prometheus themselves and enables the scrape endpoint in Drasi Server config. Drasi Server exposes `/metrics` on a configurable port.
 
-4. **Operator pushing metrics via OTLP**: An operator configures OTLP metrics export instead of Prometheus scrape. Drasi Server installs a `metrics-exporter-opentelemetry` recorder that pushes to the OTLP endpoint.
+4. **Operator pushing metrics via OTLP**: An operator runs an OTLP collector and configures Drasi Server to push metrics to it.
 
 ### Goals
 
-- Install a `tracing::Subscriber` that sends drasi-lib's spans to stdout and optionally to an OTLP endpoint
-- Install a `metrics::Recorder` that exports drasi-lib's metrics via Prometheus scrape endpoint or OTLP push
+- Install a `tracing::Subscriber` that sends drasi-lib's spans to stdout and optionally to a user-provided OTLP endpoint
+- Install a `metrics::Recorder` that exports drasi-lib's metrics via a Prometheus scrape endpoint or OTLP push to a user-provided endpoint
 - Make telemetry configuration available via YAML config and environment variable overrides
 - Preserve the existing `ComponentLogLayer` and per-component log streaming API endpoints
 - Preserve the existing `logLevel` configuration
@@ -40,6 +39,7 @@ See the [drasi-lib observability design](../../drasi-lib/tracing-logging/00-obse
 ### Non-Goals
 
 - Adding new tracing spans specific to Drasi Server's API layer (Axum routes, plugin management). This may be added later.
+- Managing or running telemetry backends (Jaeger, Prometheus, OTLP collectors) on behalf of the user.
 
 ## Design Requirements
 
@@ -47,19 +47,20 @@ See the [drasi-lib observability design](../../drasi-lib/tracing-logging/00-obse
 
 1. **Backward compatible**: Existing Drasi Server deployments with no telemetry config MUST continue to work — structured logs on stdout with the configured `logLevel`.
 2. **Opt-in telemetry export**: OTLP tracing and metrics export MUST be opt-in via configuration. No external connections by default.
-3. **Layered subscribers**: The `ComponentLogLayer` (installed by drasi-lib's `get_or_init_global_registry()`) MUST coexist with any plugin-provided layers.
-4. **Plugin-based backends**: Telemetry backends MUST be dynamically loaded plugins, consistent with the existing source/reaction plugin model. The drasi-server binary MUST NOT statically link OTLP or Prometheus exporter libraries.
+3. **Layered subscribers**: The `ComponentLogLayer` (installed by drasi-lib's `get_or_init_global_registry()`) MUST coexist with the OTLP and fmt layers.
 
 ### Dependencies
 
 | Dependency | Version | Purpose | Notes |
 |------------|---------|---------|-------|
 | `drasi-lib` | current | Emits spans and metrics via facades | Existing dependency |
-| `drasi_host_sdk` | current | Plugin loading infrastructure | Existing dependency |
 | `tracing` | `0.1` | Tracing facade | **Move from dev to production dependency** |
 | `tracing-subscriber` | `0.3` | Subscriber composition (Registry, fmt, env-filter) | **New production dependency** |
-
-
+| `tracing-opentelemetry` | `0.21+` | Bridge tracing spans → OTLP | **New dependency** |
+| `opentelemetry` | `0.20+` | OTLP trace/metrics SDK | **New dependency** |
+| `opentelemetry-otlp` | `0.13+` | OTLP gRPC exporter | **New dependency** |
+| `opentelemetry_sdk` | `0.20+` | OTel runtime | **New dependency** |
+| `metrics-exporter-prometheus` | `0.16+` | Prometheus scrape endpoint | **New dependency** |
 
 ### Out of Scope
 
@@ -71,7 +72,7 @@ See the [drasi-lib observability design](../../drasi-lib/tracing-logging/00-obse
 
 ### High-Level Design
 
-Drasi Server currently initializes logging by setting `RUST_LOG` from the YAML config's `logLevel` field and calling `get_or_init_global_registry()` from drasi-lib. This design extends that initialization by loading telemetry plugins — dynamically loaded shared libraries that install tracing subscriber layers and metrics recorders. This follows the same pattern as source/reaction plugins: users declare what they need in config, plugins are auto-installed from OCI registries, and the server loads them at startup.
+Drasi Server currently initializes logging by setting `RUST_LOG` from the YAML config's `logLevel` field and calling `get_or_init_global_registry()` from drasi-lib. This design adds an optional `telemetry` config section. When present, Drasi Server builds the appropriate OTLP tracing layer and/or metrics recorder at startup and connects to the user-provided endpoints. The user is responsible for running their own backends (Jaeger, Prometheus, OTLP collector).
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -80,27 +81,27 @@ Drasi Server currently initializes logging by setting `RUST_LOG` from the YAML c
 │  Startup:                                                           │
 │                                                                     │
 │  1. Load config                                                     │
-│  2. Discover & load telemetry plugins (libdrasi_telemetry_*)        │
-│  3. Build tracing subscriber:                                       │
+│  2. Build tracing subscriber:                                       │
 │     ┌─ Registry ────────────────────────────────────────────────┐   │
 │     │  ┌─────────────────┐  ┌────────────────────────────────┐  │   │
 │     │  │ ComponentLogLayer│  │ fmt layer (stdout, built-in)   │  │   │
 │     │  │ (from drasi-lib) │  │ (filtered by logLevel)         │  │   │
 │     │  └─────────────────┘  └────────────────────────────────┘  │   │
 │     │  ┌────────────────────────────────────────────────────┐   │   │
-│     │  │ Plugin-provided layers (e.g., OTLP from            │   │   │
-│     │  │ libdrasi_telemetry_otlp)                            │   │   │
+│     │  │ OTLP layer (if telemetry.tracing.endpoint set)     │   │   │
+│     │  │ → connects to user-provided Jaeger/OTLP collector  │   │   │
 │     │  └────────────────────────────────────────────────────┘   │   │
 │     └───────────────────────────────────────────────────────────┘   │
 │                                                                     │
-│  4. Plugin-installed metrics recorder (e.g., Prometheus from        │
-│     libdrasi_telemetry_prometheus)                                   │
+│  3. Install metrics recorder (if telemetry.metrics configured):     │
+│     → Prometheus: expose /metrics on configured port                │
+│     → OTLP: push to user-provided endpoint                         │
 │                                                                     │
-│  5. Start DrasiLib instances (unchanged)                            │
+│  4. Start DrasiLib instances (unchanged)                            │
 │     → drasi-lib emits spans + metrics through facades               │
-│     → data flows to plugin-installed subscriber + recorder          │
+│     → data flows to installed subscriber + recorder                 │
 │                                                                     │
-│  6. On shutdown: call plugin shutdown hooks, flush telemetry        │
+│  5. On shutdown: flush pending spans/metrics, shutdown provider     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -108,7 +109,7 @@ Drasi Server currently initializes logging by setting `RUST_LOG` from the YAML c
 
 #### 1. Configuration
 
-Telemetry plugins are declared in the same `plugins` array used for sources and reactions, and configured in a new `telemetry` section:
+The `DrasiServerConfig` is extended with an optional `telemetry` section:
 
 ```yaml
 # config/server.yaml
@@ -118,165 +119,140 @@ host: 0.0.0.0
 port: 8080
 logLevel: info
 
-# Telemetry plugins listed alongside source/reaction plugins
-plugins:
-  - ref: source/postgres:0.1.8
-  - ref: reaction/webhook:0.1.0
-  - ref: telemetry/otlp:0.1.0           # NEW: telemetry plugin
-  - ref: telemetry/prometheus:0.1.0     # NEW: telemetry plugin
-
-# NEW: optional telemetry configuration (passed to loaded plugins)
+# NEW: optional telemetry section
 telemetry:
   tracing:
-    kind: otlp                             # matches telemetry plugin kind
-    endpoint: "http://localhost:4317"
-    serviceName: "drasi-server"
+    endpoint: "http://jaeger:4317"       # gRPC OTLP endpoint; omit to disable
+    serviceName: "drasi-server"           # OTel service.name resource attribute
   metrics:
-    kind: prometheus                       # matches telemetry plugin kind
-    port: 9090
-    path: "/metrics"
+    backend: prometheus                   # "prometheus" or "otlp"
+    prometheus:
+      port: 9090                          # Scrape endpoint port
+      path: "/metrics"                    # Scrape path
+    otlp:
+      endpoint: "http://otel-collector:4317"
+      exportInterval: 30                  # Export interval in seconds
 ```
 
-All telemetry fields support environment variable interpolation using the existing `${VAR:-default}` syntax:
+All fields support environment variable interpolation:
 
 ```yaml
 telemetry:
   tracing:
-    kind: otlp
     endpoint: "${OTEL_ENDPOINT:-}"
   metrics:
-    kind: prometheus
-    port: "${METRICS_PORT:-9090}"
+    backend: "${METRICS_BACKEND:-prometheus}"
+    prometheus:
+      port: "${METRICS_PORT:-9090}"
 ```
 
-When no telemetry plugins are installed or the `telemetry` section is omitted, Drasi Server behaves exactly as today — stdout logs at the configured `logLevel`, no external telemetry export.
+When the `telemetry` section is omitted, Drasi Server behaves exactly as today — stdout logs at the configured `logLevel`, no external connections.
 
-#### 2. Telemetry Plugin Descriptor Trait
+#### 2. Tracing Subscriber Setup
 
-A new `TelemetryPluginDescriptor` trait is added to `drasi_plugin_sdk`, following the same pattern as `SourcePluginDescriptor` and `ReactionPluginDescriptor`:
+On startup, Drasi Server composes a multi-layer tracing subscriber:
 
 ```rust
-// drasi_plugin_sdk::telemetry
+fn init_tracing(config: &DrasiServerConfig) {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(&config.log_level));
 
-/// Descriptor for a telemetry plugin loaded as a shared library.
-pub trait TelemetryPluginDescriptor: Send + Sync {
-    /// Plugin kind (e.g., "otlp", "prometheus"). Matched against config.
-    fn kind(&self) -> &str;
+    let fmt_layer = tracing_subscriber::fmt::layer().with_filter(filter);
+    let component_layer = get_component_log_layer();
 
-    /// Called during server startup to install a tracing subscriber layer.
-    /// Returns a boxed layer that will be composed into the global subscriber.
-    /// Return None if this plugin doesn't provide tracing export.
-    fn create_tracing_layer(
-        &self,
-        config: &serde_json::Value,
-    ) -> Option<Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>>;
+    // Only create OTLP layer if endpoint is configured
+    let otel_layer = config.telemetry.as_ref()
+        .and_then(|t| t.tracing.as_ref())
+        .and_then(|t| t.endpoint.as_ref())
+        .filter(|ep| !ep.is_empty())
+        .map(|endpoint| {
+            let tracer = opentelemetry_otlp::new_pipeline()
+                .tracing()
+                .with_exporter(
+                    opentelemetry_otlp::new_exporter().tonic().with_endpoint(endpoint),
+                )
+                .with_trace_config(
+                    opentelemetry_sdk::trace::config()
+                        .with_resource(Resource::new(vec![
+                            KeyValue::new("service.name",
+                                config.telemetry.as_ref()
+                                    .and_then(|t| t.tracing.as_ref())
+                                    .and_then(|t| t.service_name.clone())
+                                    .unwrap_or_else(|| "drasi-server".to_string())),
+                        ])),
+                )
+                .install_batch(opentelemetry_sdk::runtime::Tokio)
+                .expect("Failed to initialize OTLP tracer");
 
-    /// Called during server startup to install a metrics recorder.
-    /// The plugin is responsible for calling metrics::set_global_recorder().
-    /// Return None if this plugin doesn't provide metrics export.
-    fn install_metrics_recorder(
-        &self,
-        config: &serde_json::Value,
-    ) -> Result<(), Box<dyn std::error::Error>>;
+            tracing_opentelemetry::layer().with_tracer(tracer)
+        });
 
-    /// Called on graceful shutdown to flush pending data.
-    fn shutdown(&self);
+    Registry::default()
+        .with(component_layer)
+        .with(fmt_layer)
+        .with(otel_layer)
+        .init();
 }
 ```
 
-Plugins are discovered at startup from shared libraries matching `libdrasi_telemetry_*` — the same file naming and loading pattern used for source/reaction plugins.
-
-#### 3. Example Telemetry Plugins
-
-**`libdrasi_telemetry_otlp`** — provides both tracing and metrics via OTLP:
+#### 3. Metrics Recorder Setup
 
 ```rust
-// Inside the OTLP telemetry plugin crate
-struct OtlpTelemetryPlugin;
+fn init_metrics(config: &DrasiServerConfig) {
+    let metrics_config = match config.telemetry.as_ref().and_then(|t| t.metrics.as_ref()) {
+        Some(m) => m,
+        None => return, // No config → no recorder → metrics calls are no-ops
+    };
 
-impl TelemetryPluginDescriptor for OtlpTelemetryPlugin {
-    fn kind(&self) -> &str { "otlp" }
+    match metrics_config.backend.as_deref() {
+        Some("prometheus") | None => {
+            let port = metrics_config.prometheus.as_ref()
+                .and_then(|p| p.port)
+                .unwrap_or(9090);
 
-    fn create_tracing_layer(&self, config: &Value) -> Option<Box<dyn Layer<Registry> + Send + Sync>> {
-        let endpoint = config["endpoint"].as_str()?;
-        let service_name = config.get("serviceName")
-            .and_then(|v| v.as_str())
-            .unwrap_or("drasi-server");
+            metrics_exporter_prometheus::PrometheusBuilder::new()
+                .with_http_listener(([0, 0, 0, 0], port))
+                .install()
+                .expect("Failed to install Prometheus recorder");
 
-        let tracer = opentelemetry_otlp::new_pipeline()
-            .tracing()
-            .with_exporter(opentelemetry_otlp::new_exporter().tonic().with_endpoint(endpoint))
-            .with_trace_config(/* ... service_name ... */)
-            .install_batch(opentelemetry_sdk::runtime::Tokio)
-            .ok()?;
+            log::info!("Prometheus metrics endpoint on port {}", port);
+        }
+        Some("otlp") => {
+            let endpoint = metrics_config.otlp.as_ref()
+                .and_then(|o| o.endpoint.as_ref())
+                .expect("OTLP metrics endpoint required when backend=otlp");
 
-        Some(Box::new(tracing_opentelemetry::layer().with_tracer(tracer)))
-    }
-
-    fn install_metrics_recorder(&self, config: &Value) -> Result<(), Box<dyn std::error::Error>> {
-        // Install OTLP metrics exporter
-        Ok(())
-    }
-
-    fn shutdown(&self) {
-        opentelemetry::global::shutdown_tracer_provider();
+            // Install OTLP metrics push exporter
+            log::info!("OTLP metrics export to {}", endpoint);
+        }
+        Some(other) => {
+            log::warn!("Unknown metrics backend '{}', metrics disabled", other);
+        }
     }
 }
 ```
 
-**`libdrasi_telemetry_prometheus`** — provides metrics only via scrape endpoint:
-
-```rust
-struct PrometheusTelemetryPlugin;
-
-impl TelemetryPluginDescriptor for PrometheusTelemetryPlugin {
-    fn kind(&self) -> &str { "prometheus" }
-
-    fn create_tracing_layer(&self, _config: &Value) -> Option<Box<dyn Layer<Registry> + Send + Sync>> {
-        None  // Prometheus is metrics-only, no tracing layer
-    }
-
-    fn install_metrics_recorder(&self, config: &Value) -> Result<(), Box<dyn std::error::Error>> {
-        let port = config.get("port").and_then(|v| v.as_u64()).unwrap_or(9090) as u16;
-        metrics_exporter_prometheus::PrometheusBuilder::new()
-            .with_http_listener(([0, 0, 0, 0], port))
-            .install()?;
-        Ok(())
-    }
-
-    fn shutdown(&self) { /* Prometheus recorder is dropped automatically */ }
-}
-```
-
-#### 4. Server Startup: Loading and Composing Plugins
-
-Drasi Server's startup sequence is extended to load telemetry plugins before building the tracing subscriber:
+#### 4. Startup Order
 
 ```
 1. Load config (existing)
-2. Install source/reaction plugins from OCI (existing)
-3. Install telemetry plugins from OCI (NEW — same mechanism)
-4. Load telemetry plugins: discover libdrasi_telemetry_* shared libraries
-5. Build tracing subscriber:
-   a. ComponentLogLayer (from drasi-lib)
-   b. fmt layer (stdout, built-in)
-   c. For each loaded telemetry plugin where config.telemetry.tracing.kind
-      matches plugin.kind(): call create_tracing_layer() and add to subscriber
-6. For each loaded telemetry plugin where config.telemetry.metrics.kind
-   matches plugin.kind(): call install_metrics_recorder()
-7. get_or_init_global_registry() (existing)
-8. Build and start DrasiLib instances (existing)
-9. Start Axum API server (existing)
+2. init_tracing(config)          ← NEW
+3. init_metrics(config)          ← NEW
+4. get_or_init_global_registry() (existing)
+5. Build and start DrasiLib instances (existing)
+6. Start Axum API server (existing)
 ```
 
-On shutdown:
-```
-1. Stop DrasiLib instances (existing)
-2. Call shutdown() on each loaded telemetry plugin (NEW)
-3. Stop Axum API server (existing)
+#### 5. Shutdown
+
+On graceful shutdown (SIGTERM/SIGINT), flush pending telemetry:
+
+```rust
+opentelemetry::global::shutdown_tracer_provider();
+// Prometheus recorder is dropped automatically
 ```
 
-> **Note**: The interaction between the composed subscriber and `get_or_init_global_registry()` needs care. Currently `get_or_init_global_registry()` sets the global subscriber. With this design, Drasi Server sets the global subscriber first (with ComponentLogLayer + plugin layers composed in), so `get_or_init_global_registry()` may need to be refactored to return the layer rather than installing the subscriber itself.
+> **Note**: The interaction between `init_tracing` and `get_or_init_global_registry()` needs care. Currently `get_or_init_global_registry()` sets the global subscriber. With this design, Drasi Server sets the global subscriber first (with ComponentLogLayer composed in), so `get_or_init_global_registry()` may need to be refactored to return the layer rather than installing the subscriber itself.
 
 ### API Design
 
@@ -284,23 +260,23 @@ N/A — no changes to Drasi Server's REST API. The Prometheus scrape endpoint (`
 
 ### Alternatives Considered
 
-#### 1. Statically Compile All Backends into the Drasi Server Binary
+#### 1. Telemetry Backends as Dynamic Plugins
 
-Add `tracing-opentelemetry`, `opentelemetry-otlp`, `metrics-exporter-prometheus`, etc. directly to drasi-server's `Cargo.toml` and select backends via config at runtime.
+Load telemetry backends as dynamically loaded shared libraries (`libdrasi_telemetry_*`), following the same OCI-based plugin model used for sources and reactions.
 
-**Rejected because**: This bloats the binary with all possible backends even if the user only needs one (or none). It also means adding a new backend requires a drasi-server release. The plugin approach lets users install only what they need and allows third-party telemetry plugins without changes to drasi-server.
+**Rejected because**: The `tracing_subscriber::Layer` trait uses generics and is not FFI-safe across shared library boundaries — this is a significant technical challenge with no clean solution. The binary size savings are minimal (OTLP + Prometheus add a few MB). The plugin approach adds complexity (new trait, C ABI bridge, OCI packaging, plugin loader changes) for limited benefit. Statically compiling the supported backends is simpler and sufficient.
 
 #### 2. Let Users Configure Telemetry Entirely Outside Drasi Server
 
-Rely on `RUST_LOG` and OpenTelemetry's auto-instrumentation environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, etc.) without any Drasi Server config.
+Rely on `RUST_LOG` and OpenTelemetry's auto-instrumentation environment variables without any Drasi Server config.
 
-**Rejected because**: OpenTelemetry's env var auto-configuration requires the application to opt into it with code. There's no way to auto-install a `tracing-opentelemetry` layer or a `metrics::Recorder` just from env vars — the setup code must exist in the binary (or plugin). The YAML config makes telemetry a first-class, documented feature.
+**Rejected because**: OpenTelemetry's env var auto-configuration requires the application to opt into it with code. There's no way to auto-install a `tracing-opentelemetry` layer or a `metrics::Recorder` just from env vars — the setup code must exist in the binary. The YAML config makes telemetry a first-class, documented feature.
 
 #### 3. Hard-Code OTLP as the Only Export Backend
 
 Always export to OTLP, require users to run an OpenTelemetry Collector to fan out to Prometheus/Jaeger/etc.
 
-**Rejected because**: For simple deployments (single Docker container), requiring an OTel Collector just to get Prometheus metrics is heavy. The plugin approach lets users choose Prometheus directly without an intermediate collector.
+**Rejected because**: For simple deployments (single Docker container), requiring an OTel Collector just to get Prometheus metrics is heavy. Supporting both Prometheus scrape and OTLP push directly lets users choose the simpler option.
 
 ## Security
 
@@ -311,8 +287,8 @@ Always export to OTLP, require users to run an OpenTelemetry Collector to fan ou
 ## Compatibility Impact
 
 - **No breaking changes**: Existing configs without a `telemetry` section work exactly as before.
-- **No new heavy dependencies in drasi-server**: OTLP and Prometheus libraries live inside their respective telemetry plugins, not in the server binary.
-- **`get_or_init_global_registry()` interaction**: May require a minor refactor in drasi-lib to support composing `ComponentLogLayer` into an externally-built subscriber. This is backward compatible — the function can detect whether a global subscriber is already set.
+- **New dependencies**: `tracing-opentelemetry`, `opentelemetry-otlp`, `metrics-exporter-prometheus` are added to the binary. They are only active when configured.
+- **`get_or_init_global_registry()` interaction**: May require a minor refactor in drasi-lib to support composing `ComponentLogLayer` into an externally-built subscriber.
 
 ## Supportability
 
@@ -321,37 +297,34 @@ Always export to OTLP, require users to run an OpenTelemetry Collector to fan ou
 | Test | Scope | Approach |
 |------|-------|----------|
 | Default config (no telemetry) | Integration | Start server with no `telemetry` section; verify stdout logs appear, no crashes |
-| OTLP tracing plugin | Integration | Install `telemetry/otlp` plugin, configure endpoint to mock OTLP receiver; verify spans arrive |
-| Prometheus plugin | Integration | Install `telemetry/prometheus` plugin; `curl localhost:9090/metrics`; verify drasi-lib metrics appear |
-| Unknown plugin kind | Integration | Configure `telemetry.tracing.kind: foo` with no matching plugin; verify graceful warning, server starts without export |
+| OTLP tracing | Integration | Configure endpoint to mock OTLP receiver; verify spans arrive |
+| Prometheus scrape | Integration | Enable Prometheus backend; `curl localhost:9090/metrics`; verify drasi-lib metrics appear |
+| OTLP metrics | Integration | Configure OTLP metrics endpoint; verify metrics arrive at mock receiver |
 | Env var override | Unit | Set `OTEL_ENDPOINT` env var; verify config resolves correctly |
 | Shutdown flush | Integration | Send SIGTERM; verify pending spans are exported before exit |
+| Unreachable endpoint | Integration | Configure non-existent OTLP endpoint; verify server starts gracefully, logs warning |
 
 ## Development Plan
 
 | Phase | Work Items |
 |-------|-----------|
-| 1. Plugin SDK | Add `TelemetryPluginDescriptor` trait to `drasi_plugin_sdk`. Define C ABI vtable for `create_tracing_layer`, `install_metrics_recorder`, `shutdown`. |
-| 2. Plugin loader | Extend `PluginLoader` to discover and load `libdrasi_telemetry_*` shared libraries. Add `TelemetryPluginRegistry`. |
-| 3. Config types | Add `TelemetryConfig` with `tracing.kind`/`metrics.kind` + generic JSON config pass-through to `config/types.rs`. |
-| 4. Server startup | Compose subscriber from ComponentLogLayer + fmt + plugin-provided layers. Call `install_metrics_recorder` for metrics plugins. Resolve `get_or_init_global_registry()` interaction. |
-| 5. OTLP plugin | Implement `libdrasi_telemetry_otlp` plugin crate. Publish to OCI registry. |
-| 6. Prometheus plugin | Implement `libdrasi_telemetry_prometheus` plugin crate. Publish to OCI registry. |
-| 7. Shutdown | Call `shutdown()` on loaded telemetry plugins during graceful shutdown. |
-| 8. Tests | Integration tests for each plugin. Test missing plugin graceful degradation. |
-| 9. Documentation | Update Drasi Server docs with telemetry plugin configuration reference. |
+| 1. Config types | Add `TelemetryConfig`, `TracingConfig`, `MetricsConfig` structs to `config/types.rs` with serde deserialization + env var interpolation |
+| 2. Dependencies | Add `tracing-opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk`, `metrics-exporter-prometheus` to `Cargo.toml` |
+| 3. Tracing setup | Implement `init_tracing()` — compose Registry with fmt + ComponentLogLayer + optional OTLP layer. Resolve `get_or_init_global_registry()` interaction |
+| 4. Metrics setup | Implement `init_metrics()` — Prometheus scrape endpoint and OTLP push |
+| 5. Shutdown | Add tracer provider shutdown to the existing graceful shutdown handler |
+| 6. Tests | Integration tests for each backend config + graceful degradation |
+| 7. Documentation | Update Drasi Server docs with telemetry configuration reference |
 
 ## Open Issues
 
-1. **`get_or_init_global_registry()` refactor**: This function currently installs the global subscriber. Drasi Server needs to compose `ComponentLogLayer` into its own subscriber alongside plugin-provided layers. Should `get_or_init_global_registry()` be changed to return the layer, or should Drasi Server bypass it and construct the `ComponentLogLayer` directly?
+1. **`get_or_init_global_registry()` refactor**: This function currently installs the global subscriber. Drasi Server needs to compose `ComponentLogLayer` into its own subscriber. Should `get_or_init_global_registry()` be changed to return the layer, or should Drasi Server bypass it and construct the `ComponentLogLayer` directly?
 
-2. **C ABI for tracing layers**: The `tracing_subscriber::Layer` trait uses generics and is not directly FFI-safe. The plugin SDK needs a stable C ABI bridge for passing layers across the shared library boundary. Options include: (a) a `Box<dyn Layer>` with vtable, (b) having the plugin install the global subscriber itself rather than returning a layer, or (c) having the plugin communicate via a simpler interface (e.g., return an OTLP endpoint string and let the server build the layer). This is the key technical challenge of the plugin approach.
+2. **Metrics port conflict**: If the Prometheus metrics port conflicts with the Drasi Server API port, should we serve `/metrics` on the same Axum server instead of a separate listener?
 
-3. **Multiple metrics recorders**: The `metrics` crate only supports one global recorder. If a user configures both a Prometheus and an OTLP metrics plugin, which one wins? Options: first-configured wins with a warning, or use `metrics-fanout` crate to fan out to multiple recorders.
+3. **Trace sampling**: For high-throughput deployments, should the config support a sampling rate (e.g., `samplingRate: 0.1` to export 10% of traces)?
 
-4. **Metrics port conflict**: If the Prometheus metrics port conflicts with the Drasi Server API port, should we serve `/metrics` on the same Axum server instead of a separate listener?
-
-5. **Trace sampling**: For high-throughput deployments, should telemetry plugins support a sampling rate config (e.g., `samplingRate: 0.1` to export 10% of traces)?
+4. **Multiple metrics backends**: The `metrics` crate only supports one global recorder. If a user wants both Prometheus scrape and OTLP push simultaneously, we'd need `metrics-fanout`. Is this a requirement, or is one-backend-at-a-time sufficient?
 
 ## References
 

@@ -4,7 +4,7 @@
 
 ## Overview
 
-drasi-lib is a Rust crate that embeds Drasi's continuous query engine in-process. Today it uses the `log` crate for basic logging and a custom `ComponentLogLayer` (built on `tracing`) to route per-component logs to an internal registry. While this gives developers per-component log streams, there is no structured span hierarchy across the Source → Query → Reaction pipeline, no counters or histograms for operational metrics, and no way to export telemetry to external backends such as Jaeger or Prometheus.
+drasi-lib today uses the `log` crate for basic logging and a custom `ComponentLogLayer` (built on `tracing`) to route per-component logs to an internal registry. While this gives developers per-component log streams, there is no structured span hierarchy across the Source → Query → Reaction pipeline, no counters or histograms for operational metrics, and no way to export telemetry to external backends such as Jaeger or Prometheus.
 
 This design adds structured tracing spans and explicit metrics to drasi-lib's pipeline so that developers embedding the library can follow an event end-to-end. drasi-lib emits telemetry through the `tracing` and `metrics` facade crates; the embedding application decides where the data goes by installing subscribers and recorders.
 
@@ -71,18 +71,6 @@ The existing log events continue to work — they just now appear inside spans t
 2. **Backward compatible**: Existing applications that use `log` crate macros and `ComponentLogLayer` MUST continue to work without changes. The `tracing-log` bridge already forwards `log::info!()` events to `tracing`.
 3. **Structured fields**: All spans will include identifying fields (`source_id`, `query_id`, `reaction_id`) so that traces can be filtered and correlated.
 4. **Metric naming**: All metrics use the `drasi.` prefix and follow the pattern `drasi.<component>.<metric_name>` (e.g., `drasi.query.events_processed`).
-
-### Dependencies
-
-| Dependency | Version | Purpose | Notes |
-|------------|---------|---------|-------|
-| `tracing` | `0.1` | Span and event facade | Already a dependency |
-| `tracing-subscriber` | `0.3` | Subscriber utilities | Already a dependency |
-| `tracing-log` | `0.2` | Bridge `log` → `tracing` | Already a dependency |
-| `metrics` | `0.24` | Counter, histogram, gauge facade | **New dependency** |
-| `log` | `0.4` | Legacy logging | Already a dependency, continue to support via bridge |
-
-No new OpenTelemetry dependencies are added to drasi-lib. OTel integration happens in the embedding application.
 
 ### Out of Scope
 
@@ -284,27 +272,19 @@ async {
 }.instrument(receive_span).await;
 ```
 
-> **`follows_from` vs parent-child**: We use `follows_from` rather than true parent-child nesting because the upstream span may have already ended by the time the downstream task dequeues the event. `follows_from` establishes a causal link ("this span was caused by that span") without requiring both to be open simultaneously. Trace viewers like Jaeger render `follows_from` links as part of the same trace.
 
 #### 5. Metrics Definitions
 
-**Already tracked internally** (exposed via `PriorityQueueMetrics` atomics or `ProfilingMetadata` timestamps, but not exportable to Prometheus/OTLP — the `metrics` crate bridges them):
-
-| Metric | Type | Labels | Existing internal source |
-|--------|------|--------|--------------------------|
-| `drasi.source.events_enqueued` | Counter | `source_id` | `PriorityQueueMetrics.total_enqueued` |
-| `drasi.query.processing_duration_ms` | Histogram | `query_id` | `ProfilingMetadata` per-event timestamps (sampled) |
-| `drasi.query.queue_depth` | Gauge | `query_id` | `PriorityQueueMetrics.current_depth` |
-| `drasi.reaction.dispatch_duration_ms` | Histogram | `reaction_id` | `ProfilingMetadata` per-event timestamps (sampled) |
-
-**New metrics** (not tracked anywhere today):
-
 | Metric | Type | Labels | Where Recorded |
 |--------|------|--------|----------------|
-| `drasi.source.events_received` | Counter | `source_id` | Forwarder task, on each event received from source context channel |
-| `drasi.query.events_processed` | Counter | `query_id` | Event processor loop, after successful `process_source_change` |
+| `drasi.source.events_received` | Counter | `source_id` | Forwarder task in `DrasiQuery::start()`, on each event received from source context channel |
+| `drasi.source.events_enqueued` | Counter | `source_id` | Forwarder task in `DrasiQuery::start()`, after `priority_queue.enqueue_wait()` |
+| `drasi.query.events_processed` | Counter | `query_id` | Event processor loop, after `process_source_change` completes successfully |
+| `drasi.query.processing_duration_ms` | Histogram | `query_id` | Event processor loop, elapsed time of `process_source_change` |
+| `drasi.query.queue_depth` | Gauge | `query_id` | `PriorityQueue` on enqueue/dequeue |
 | `drasi.query.errors` | Counter | `query_id`, `error_type` | Event processor loop, on `process_source_change` error |
 | `drasi.reaction.events_dispatched` | Counter | `reaction_id`, `query_id` | `dispatch_query_results()`, per dispatcher call |
+| `drasi.reaction.dispatch_duration_ms` | Histogram | `reaction_id` | Reaction forwarder task, elapsed time of `enqueue_query_result()` |
 | `drasi.reaction.errors` | Counter | `reaction_id`, `error_type` | Reaction forwarder task, on `enqueue_query_result()` error |
 
 #### 6. Interaction with Existing ComponentLogLayer
