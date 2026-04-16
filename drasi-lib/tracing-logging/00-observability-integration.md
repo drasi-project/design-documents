@@ -60,7 +60,7 @@ The existing log events continue to work — they just now appear inside spans t
 ### Non-Goals
 
 - Providing a built-in telemetry backend or OTLP exporter within drasi-lib. Perhaps we can include some examples
-- Changes to drasi-server.
+- Changes to Drasi Server.
 - Distributed trace context propagation from external callers into drasi-lib source plugins. Source plugins that want to propagate parent context can do so via their own spans.
 
 ## Design Requirements
@@ -75,7 +75,7 @@ The existing log events continue to work — they just now appear inside spans t
 ### Out of Scope
 
 - **drasi-core instrumentation**: The query engine internals (`ContinuousQuery::process_source_change`, index operations) are treated as a black box from the instrumentation perspective.
-- **drasi-server changes**: How drasi-server wires up subscribers/recorders for these new traces is a separate design document.
+- **Drasi Server changes**: How Drasi Server wires up subscribers/recorders for these new traces is a separate design document.
 - **Custom source/reaction plugin instrumentation**: Plugin authors can add their own spans, but drasi-lib does not enforce or require it.
 - **Log format changes**: The `ComponentLogLayer` output format and API remain unchanged.
 
@@ -226,8 +226,8 @@ async {
     match continuous_query.process_source_change(item.event.as_ref().clone()).await {
         Ok(results) => {
             metrics::counter!("drasi.query.events_processed", "query_id" => self.id.clone()).increment(1);
-            metrics::histogram!("drasi.query.processing_duration_ms", "query_id" => self.id.clone())
-                .record(start.elapsed().as_millis() as f64);
+            metrics::histogram!("drasi.query.processing_duration_ns", "query_id" => self.id.clone())
+                .record(start.elapsed().as_nanos() as f64);
 
             // dispatch_query_results also carries the current span for reaction.receive
             dispatch_query_results(&self.dispatchers, &results).await;
@@ -261,8 +261,8 @@ async {
     let start = std::time::Instant::now();
     match reaction.enqueue_query_result(dispatched_result.data).await {
         Ok(_) => {
-            metrics::histogram!("drasi.reaction.dispatch_duration_ms", "reaction_id" => reaction_id.clone())
-                .record(start.elapsed().as_millis() as f64);
+            metrics::histogram!("drasi.reaction.dispatch_duration_ns", "reaction_id" => reaction_id.clone())
+                .record(start.elapsed().as_nanos() as f64);
         }
         Err(err) => {
             metrics::counter!("drasi.reaction.errors", "reaction_id" => reaction_id.clone(), "error_type" => err.variant_name()).increment(1);
@@ -280,9 +280,9 @@ async {
 | Metric | Type | Labels | Existing internal source |
 |--------|------|--------|--------------------------|
 | `drasi.source.events_enqueued` | Counter | `source_id` | `PriorityQueueMetrics.total_enqueued` |
-| `drasi.query.processing_duration_ms` | Histogram | `query_id` | `ProfilingMetadata` per-event timestamps (sampled) |
+| `drasi.query.processing_duration_ns` | Histogram | `query_id` | `ProfilingMetadata` per-event timestamps (sampled) |
 | `drasi.query.queue_depth` | Gauge | `query_id` | `PriorityQueueMetrics.current_depth` |
-| `drasi.reaction.dispatch_duration_ms` | Histogram | `reaction_id` | `ProfilingMetadata` per-event timestamps (sampled) |
+| `drasi.reaction.dispatch_duration_ns` | Histogram | `reaction_id` | `ProfilingMetadata` per-event timestamps (sampled) |
 
 **New metrics** (not tracked anywhere today):
 
@@ -406,7 +406,7 @@ This design *is* the telemetry story for drasi-lib. After implementation, the fo
 
 2. **Bootstrap span granularity**: During bootstrap, `process_source_change` is called once per initial data element (potentially thousands). Should each bootstrap event get its own `query.bootstrap` span, or should there be a single parent span for the entire bootstrap phase with lightweight events per element?
 
-3. **Histogram bucket configuration**: The `metrics` crate leaves bucket configuration to the recorder. Should drasi-lib document recommended histogram buckets for `processing_duration_ms` and `dispatch_duration_ms`, or leave that entirely to the user?
+3. **Histogram bucket configuration**: The `metrics` crate leaves bucket configuration to the recorder. Should drasi-lib document recommended histogram buckets for `processing_duration_ns` and `dispatch_duration_ns`, or leave that entirely to the user?
 
 4. **Span naming convention**: Should span names use dots (`query.process`) or slashes (`query/process`) or OpenTelemetry-style (`drasi.query.process`)? The current proposal uses dots. This should be consistent with whatever convention drasi-platform adopts.
 
