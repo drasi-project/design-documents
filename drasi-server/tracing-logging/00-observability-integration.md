@@ -189,7 +189,53 @@ On graceful shutdown (SIGTERM/SIGINT), Drasi Server flushes any pending traces/m
 
 ### API Design
 
-N/A — no changes to Drasi Server's REST API. The Prometheus scrape endpoint (`/metrics` on a separate port) is a new HTTP listener but is not part of the management API.
+#### Builder API
+
+`DrasiServerBuilder` is extended with telemetry configuration methods:
+
+```rust
+let server = DrasiServerBuilder::new()
+    .with_id("my-server")
+    .with_host_port("0.0.0.0", 8080)
+    // NEW: telemetry configuration
+    .with_tracing_endpoint("http://jaeger:4317")
+    .with_tracing_service_name("drasi-server")
+    .with_metrics_prometheus(9090, "/metrics")
+    // or: .with_metrics_otlp("http://otel-collector:4317", 30)
+    .with_source(my_source)
+    .add_query(query)
+    .with_reaction(my_reaction)
+    .build()
+    .await?;
+```
+
+These are convenience methods that populate the `TelemetryConfig` struct. All are optional — omitting them gives current behavior (stdout logs, no external telemetry).
+
+#### `init` CLI Command
+
+The `drasi-server init` command generates a YAML config interactively. It is extended with telemetry prompts:
+
+```
+$ drasi-server init --output config/server.yaml
+
+  Server ID [auto]: my-server
+  Host [0.0.0.0]:
+  Port [8080]:
+  Log level [info]:
+
+  Enable telemetry? [y/N]: y
+    OTLP tracing endpoint (blank to skip): http://jaeger:4317
+    Service name [drasi-server]:
+    Metrics backend (prometheus/otlp/none) [none]: prometheus
+    Prometheus port [9090]:
+    Prometheus path [/metrics]:
+
+  ...
+```
+
+When telemetry is skipped, the `telemetry` section is omitted from the generated YAML — identical to current behavior.
+
+No changes to Drasi Server's existing REST API endpoints. The Prometheus scrape endpoint (`/metrics` on a separate port) is a new HTTP listener but is not part of the management API.
 
 ### Alternatives Considered
 
@@ -243,17 +289,23 @@ Always export to OTLP, require users to run an OpenTelemetry Collector to fan ou
 |-------|-----------|
 | 1. Config types | Add `TelemetryConfig`, `TracingConfig`, `MetricsConfig` structs to `config/types.rs` with serde deserialization + env var interpolation |
 | 2. Dependencies | Add `tracing-opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk`, `metrics-exporter-prometheus` to `Cargo.toml` |
-| 3. Tracing setup | Implement `init_tracing()` — compose Registry with fmt + ComponentLogLayer + optional OTLP layer. Resolve `get_or_init_global_registry()` interaction |
-| 4. Metrics setup | Implement `init_metrics()` — Prometheus scrape endpoint and OTLP push |
-| 5. Shutdown | Add tracer provider shutdown to the existing graceful shutdown handler |
-| 6. Tests | Integration tests for each backend config + graceful degradation |
-| 7. Documentation | Update Drasi Server docs with telemetry configuration reference |
+| 3. Builder API | Add `.with_tracing_endpoint()`, `.with_tracing_service_name()`, `.with_metrics_prometheus()`, `.with_metrics_otlp()` to `DrasiServerBuilder` |
+| 4. Tracing setup | Implement `init_tracing()` — compose Registry with fmt + ComponentLogLayer + optional OTLP layer. Resolve `get_or_init_global_registry()` interaction |
+| 5. Metrics setup | Implement `init_metrics()` — Prometheus scrape endpoint and OTLP push |
+| 6. `init` CLI | Extend `drasi-server init` with telemetry prompts (OTLP endpoint, service name, metrics backend, Prometheus port) |
+| 7. Shutdown | Add tracer provider shutdown to the existing graceful shutdown handler |
+| 8. Tests | Integration tests for each backend config + graceful degradation |
+| 9. Documentation | Update Drasi Server docs with telemetry configuration reference |
 
 ## Open Issues
 
 1. **Metrics port conflict**: If the Prometheus metrics port conflicts with the Drasi Server API port, should we serve `/metrics` on the same Axum server instead of a separate listener?
 
 2. **Trace sampling**: For high-throughput deployments, should the config support a sampling rate (e.g., `samplingRate: 0.1` to export 10% of traces)?
+
+### Future Consideration: Server-Level Metrics
+
+Beyond drasi-lib's pipeline metrics (source events, query processing, reaction delivery), a future iteration could add Drasi Server's own operational metrics for remote monitoring and management — e.g., `drasi.server.uptime_seconds`, `drasi.server.sources_total` (by status), `drasi.server.api_requests_total`, `drasi.server.api_request_duration_ns`, `drasi.server.config_saves_total`. These would be recorded in Axum middleware and server lifecycle code (not in drasi-lib) and flow to whatever recorder the telemetry config installs. This is not in scope for this design but is a natural next step once the telemetry infrastructure is in place.
 
 ## References
 

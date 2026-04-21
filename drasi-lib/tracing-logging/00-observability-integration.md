@@ -21,11 +21,12 @@ Today drasi-lib produces isolated log lines per component:
 You can filter by component, but you can't tell how long anything took, whether the error was related to the received event, or how long an event waited in the queue. With this design, structured spans wrap the existing log events to add duration, causality, and nesting:
 
 ```
-TRACE [1.2ms] source.ingest { source_id=postgres-src, op=insert, label=Order, element_id=Order:42 }
-  └── TRACE [45.3ms] query.process { query_id=q1, source_id=postgres-src }
-        ├── [INFO] Processing source change      ← existing log event, now inside a timed span
-        └── TRACE [3.1ms] reaction.dispatch { reaction_id=webhook, query_id=q1, added=1 }
-              └── TRACE [12.0ms] reaction.receive { reaction_id=webhook }
+TRACE [0.8ms] source.dispatch { source_id=postgres-src, op=insert, label=Order, element_id=Order:42 }
+  └── TRACE [0.1ms] query.receive { source_id=postgres-src, query_id=q1 }
+        └── TRACE [45.3ms] query.process { query_id=q1, source_id=postgres-src }
+              ├── [INFO] Processing source change      ← existing log event, now inside a timed span
+              └── TRACE [3.1ms] query.dispatch { query_id=q1, added=1 }
+                    └── TRACE [1.2ms] reaction.receive { reaction_id=webhook, query_id=q1 }
 ```
 
 The existing log events continue to work — they just now appear inside spans that provide timing context and cross-component causality.
@@ -76,7 +77,7 @@ The existing log events continue to work — they just now appear inside spans t
 
 - **drasi-core instrumentation**: The query engine internals (`ContinuousQuery::process_source_change`, index operations) are treated as a black box from the instrumentation perspective.
 - **Drasi Server changes**: How Drasi Server wires up subscribers/recorders for these new traces is a separate design document.
-- **Custom source/reaction plugin instrumentation**: Plugin authors can add their own spans, but drasi-lib does not enforce or require it.
+- **Custom source/reaction plugin internal instrumentation**: Plugin authors can add their own spans inside their plugin. This design provides the FFI infrastructure (trace context propagation, metrics forwarding) to make plugin telemetry visible to the host — see [Section 8: Plugin Observability Across FFI](#8-plugin-observability-across-ffi).
 - **Log format changes**: The `ComponentLogLayer` output format and API remain unchanged.
 
 ## Design
@@ -117,182 +118,176 @@ Spans are placed at the boundaries of each pipeline stage. They form a **single 
 ```
 Single trace per event (connected across task boundaries):
 
-  span: source.ingest (source_id, op, label, element_id)
-  │  Task 1: source forwarder
-  │  - receives event from source plugin
-  │  - captures current span handle
-  │  - enqueues (event + span handle) to PriorityQueue
+  span: source.dispatch (source_id, op, label, element_id)     [Interval A]
+  │  Task T1: source plugin
+  │  - wraps event in SourceEventWrapper
+  │  - dispatches to ChangeDispatcher channel(s)
   │
-  └──► span: query.process (query_id, source_id)           [follows_from: source.ingest]
-       │  Task 2: event processor
-       │  - dequeues from PriorityQueue
-       │  - creates query.process as child of carried span
-       │  - calls ContinuousQuery::process_source_change()
-       │  - calls dispatch_query_results()
-       │
-       └─► span: reaction.dispatch (reaction_id, query_id)  [child of: query.process]
-          │  Task 2 (same task, nested span)
-          │  - sends results to ChangeDispatcher
-          │
-          └──► span: reaction.receive (reaction_id, query_id) [follows_from: reaction.dispatch]
-                 Task 3: reaction forwarder
-                 - receives from ChangeDispatcher
-                 - creates reaction.receive as child of carried span
-                 - calls Reaction::enqueue_query_result()
+  └──► span: query.receive (source_id, query_id)               [Interval B end]
+       │  Task T2: query forwarder
+       │  - receives event from dispatcher channel
+       │  - enqueues (event + span handle) to PriorityQueue
+       │                                                        [Interval C: PQueue wait]
+       └──► span: query.process (query_id, source_id)          [Intervals D+E]
+            │  Task T3: event processor
+            │  - dequeues from PriorityQueue
+            │  - calls process_source_change()                  [Interval D]
+            │  - calls dispatch_query_results()                 [Interval E]
+            │
+            └─► span: query.dispatch (query_id, counts)         [child of: query.process]
+               │  Task T3 (same task, nested span)
+               │  - converts results, dispatches to reaction channels
+               │                                                [Interval F: channel wait]
+               └──► span: reaction.receive (reaction_id)        [Interval G start]
+                      Task T4: reaction forwarder
+                      - receives result from dispatcher channel
+                      - enqueues to reaction's PriorityQueue
 ```
 
-In Jaeger or any trace viewer, this appears as one trace with 4 spans showing the full event lifecycle, including time spent waiting in queues (the gap between a parent span ending and the child starting).
+In Jaeger or any trace viewer, this appears as one trace with 5 spans showing the full event lifecycle. The gaps between spans represent time spent in channels and queues (intervals B, C, F).
 
-#### 3. Instrumentation Points
+##### Multi-Branch Trace Trees (Fan-Out)
 
-All instrumentation is in the drasi-lib manager layer
+The diagram above shows the simple case: 1 source → 1 query → 1 reaction. The trace tree below shows how a single source event fans out into a **branching trace tree** when multiple queries and reactions are subscribed:
 
-| Location | Span / Event | Fields |
-|---|---|---|
-| `DrasiQuery::start()` — forwarder task receives event from source context channel | `source.ingest` span | `source_id`, `op`, `label`, `element_id` |
-| `DrasiQuery::start()` — forwarder task enqueues to `PriorityQueue` | `tracing::debug!` event | `source_id`, `queue_depth` |
-| `DrasiQuery::start()` — query startup | `query.start` span | `query_id`, `bootstrap_enabled` |
-| `DrasiQuery::start()` — bootstrap task | `query.bootstrap` span | `query_id`, `source_id` |
-| `DrasiQuery::start()` — event processor loop, dequeues and calls `process_source_change` | `query.process` span | `query_id`, `source_id` |
-| `dispatch_query_results()` — sends results to dispatchers | `reaction.dispatch` span | `reaction_id`, `query_id`, `added`, `updated`, `deleted` counts |
+```
+source.dispatch { source_id=postgres-src, element_id=Order:42 }          ← root span
+├──► query.receive { query_id=q1 }                                        ← fan-out #1: N queries
+│    └── query.process { query_id=q1 }
+│        └── query.dispatch { query_id=q1, added=1 }
+│            ├──► reaction.receive { reaction_id=webhook }                 ← fan-out #2: M reactions
+│            └──► reaction.receive { reaction_id=logger }
+├──► query.receive { query_id=q2 }
+│    └── query.process { query_id=q2 }
+│        └── query.dispatch { query_id=q2, added=0 }                      ← no results = no reaction spans
+└──► query.receive { query_id=q3 }
+     └── query.process { query_id=q3 }
+         └── query.dispatch { query_id=q3, added=1 }
+             └──► reaction.receive { reaction_id=webhook }                 ← same reaction, different query
+```
 
-**File: `reactions/manager.rs`**
+All branches share the same `trace_id` with `source.dispatch` as the root. In Jaeger this renders as a single expandable trace tree.
 
-| Location | Span / Event | Fields |
-|---|---|---|
-| `ReactionManager::subscribe_reaction_to_queries()` — forwarder task calls `enqueue_query_result()` | `reaction.receive` span | `reaction_id`, `query_id` |
+**Overhead**: When no `tracing::Subscriber` is installed, all `info_span!()` calls compile to no-ops — zero allocation, zero cost. When a subscriber is installed, the cost is proportional to the pipeline topology that the user explicitly configured. Each span is ~200 bytes in a typical subscriber (span name + fields + timestamps).
 
-**All error paths** — `tracing::error!` events with error message and context fields.
+#### 3. Pipeline Stages, Intervals, and Instrumentation Points
+
+Before choosing where to place spans and metrics, we first enumerate the actual pipeline stages and the time intervals we want to capture. The pipeline runs across multiple tokio tasks connected by channels and priority queues:
+
+```
+                        ┌─────────────────────────────────────────────────────────────────────┐
+                        │                     Per-Query Pipeline                               │
+                        │                                                                     │
+  Source Plugin         │  Task: query          Task: query           Task: query result       │  Task: reaction
+  (user code)           │  forwarder            processor             dispatch (same task)     │  forwarder
+                        │                                                                     │
+  ┌──────────┐    ┌─────┼───────────┐    ┌──────────────┐    ┌──────────────────────┐    ┌────┼──────────────┐    ┌──────────────┐
+  │ Source    │    │     │ Dispatcher│    │              │    │                      │    │    │ Dispatcher   │    │              │
+  │ dispatch_ │───▶│ ChangeReceiver │───▶│ PriorityQueue│───▶│ process_source_change│───▶│ ChangeReceiver  │───▶│ Reaction     │
+  │ event()   │    │     │ (channel/ │    │ (timestamp-  │    │ (drasi-core engine)  │    │    │ (channel/    │    │ PriorityQueue│
+  └──────────┘    │     │  bcast)   │    │  ordered)    │    │                      │    │    │  bcast)      │    │ + processing │
+                  │     └───────────┘    └──────────────┘    └──────────────────────┘    │    └──────────────┘    └──────────────┘
+                  │                                                                     │
+       ▲          └─────────────────────────────────────────────────────────────────────┘          ▲
+       │                                                                                          │
+       │  Interval A      B          C              D                E          F          G      │
+       └──────────────────────────────────────────────────────────────────────────────────────────┘
+
+  A: Source dispatch       — time for source to dispatch event to channel(s)
+  B: Source→Query channel  — time event waits in dispatcher channel (backpressure visible here)
+  C: Query PQueue wait     — time event waits in priority queue (ordering + backpressure)
+  D: Query engine          — time spent in ContinuousQuery::process_source_change()
+  E: Result conversion     — time to convert results + dispatch to reaction channel(s)
+  F: Query→Reaction channel — time result waits in dispatcher channel
+  G: Reaction PQueue + processing — time in reaction's priority queue + reaction plugin processing
+```
+
+**Task boundaries** (each `──▶` through a channel/queue crosses a tokio task boundary):
+
+| # | Task | Spawned by | What it does |
+|---|------|------------|-------------|
+| T1 | Source plugin task | User code / Source::start() | Calls `SourceBase::dispatch_event()` |
+| T2 | Query forwarder (1 per source per query) | `DrasiQuery::start()` | Receives from `ChangeReceiver`, enqueues to query `PriorityQueue` |
+| T3 | Query event processor (1 per query) | `DrasiQuery::start()` | Dequeues from `PriorityQueue`, calls `process_source_change`, dispatches results |
+| T4 | Reaction forwarder (1 per query per reaction) | `ReactionManager::subscribe_reaction_to_queries()` | Receives from `ChangeReceiver`, enqueues to reaction `PriorityQueue` |
+| T5 | Reaction processor (1 per reaction) | `Reaction::start()` | Dequeues from reaction `PriorityQueue`, processes results |
+
+**Fan-out points** — a single source event can fan out at two points:
+- **Source → Queries**: One source can feed N queries (1 dispatcher channel per query in Channel mode, or 1 shared broadcast)
+- **Query → Reactions**: One query result can feed M reactions (1 dispatcher channel per reaction in Channel mode, or 1 shared broadcast)
 
 #### 4. Trace Context Propagation Across Channels
 
 To link spans across task boundaries, we carry a `tracing::Span` handle through the channel alongside the event data. The downstream task uses `follows_from` to establish the causal relationship.
 
-**Carrying context through PriorityQueue**:
+##### Where to put `parent_span`: wrapper vs event
 
-The `PriorityQueueEvent` type (`channels/priority_queue.rs`) is extended to include an optional parent span:
+Trace context needs to cross two types of channel boundaries:
+1. **ChangeDispatcher** (T1→T2 source events, T3→T4 query results) — dispatches `Arc<T>` directly
+2. **PriorityQueue** (T2→T3, T4→T5) — wraps `Arc<T>` in `PriorityQueueEvent<T>`
+
+The event types (`SourceEventWrapper`, `QueryResult`) are `Arc`-wrapped for zero-copy: multiple consumers reference the same allocation without cloning the payload. **The `parent_span` must not break this zero-copy property.**
+
+**Design**: Use different strategies for each boundary:
+
+| Boundary | Strategy |
+|----------|----------|
+| **PriorityQueue** | Add `parent_span: Option<Span>` to `PriorityQueueEvent<T>` (the wrapper) |
+| **ChangeDispatcher** | Add `parent_span: Option<Span>` to the dispatched result type (`QueryResult`) |
+
+**PriorityQueue wrapper** (carries span alongside the event, not inside it):
 
 ```rust
 // channels/priority_queue.rs
 struct PriorityQueueEvent<T> {
     event: Arc<T>,
-    parent_span: Option<tracing::Span>,  // NEW: carried across the channel
+    parent_span: Option<tracing::Span>,  // NEW: on the wrapper, not inside Arc<T>
 }
 ```
 
-**Source forwarder task** (Task 1 — creates the root span and sends it):
+This preserves the zero-copy property: `Arc<T>` is cloned (just a refcount bump) when needed, but `T` itself is never cloned. The `parent_span` lives on the wrapper and is consumed when the event is dequeued — it does not add to the shared `Arc<T>` allocation.
+
+**ChangeDispatcher path** (for query results crossing to reaction forwarders):
+
+`QueryResult` gains an optional span field:
 
 ```rust
-// queries/manager.rs — source forwarder task in DrasiQuery::start()
-
-let ingest_span = info_span!(
-    "source.ingest",
-    source_id = %source_id,
-    op = %event.op(),
-    label = %event.label(),
-    element_id = %event.element_id(),
-);
-let _enter = ingest_span.enter();
-
-metrics::counter!("drasi.source.events_received", "source_id" => source_id.clone()).increment(1);
-
-// Enqueue the event WITH the current span handle
-priority_queue.enqueue_with_span(event, Some(ingest_span.clone())).await;
-
-metrics::counter!("drasi.source.events_enqueued", "source_id" => source_id.clone()).increment(1);
-```
-
-**Event processor task** (Task 2 — receives the span and links to it):
-
-```rust
-// queries/manager.rs — event processor loop in DrasiQuery::start()
-
-let item = priority_queue.dequeue().await;
-
-let process_span = info_span!(
-    "query.process",
-    query_id = %self.id,
-    source_id = %item.event.source_id(),
-);
-
-// Link this span to the upstream source.ingest span
-if let Some(parent) = &item.parent_span {
-    process_span.follows_from(parent);
+// QueryResult (queries/manager.rs or channels/events.rs)
+pub struct QueryResult {
+    pub query_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub results: Vec<ResultDiff>,
+    pub metadata: HashMap<String, serde_json::Value>,
+    pub profiling: Option<ProfilingMetadata>,
+    pub parent_span: Option<tracing::Span>,  // NEW: 8 bytes, None when no tracing backend
 }
-
-async {
-    let start = std::time::Instant::now();
-
-    match continuous_query.process_source_change(item.event.as_ref().clone()).await {
-        Ok(results) => {
-            metrics::counter!("drasi.query.events_processed", "query_id" => self.id.clone()).increment(1);
-            metrics::histogram!("drasi.query.processing_duration_ns", "query_id" => self.id.clone())
-                .record(start.elapsed().as_nanos() as f64);
-
-            // dispatch_query_results also carries the current span for reaction.receive
-            dispatch_query_results(&self.dispatchers, &results).await;
-        }
-        Err(err) => {
-            metrics::counter!("drasi.query.errors", "query_id" => self.id.clone(), "error_type" => err.variant_name()).increment(1);
-            tracing::error!(error = %err, "Error processing source change");
-        }
-    }
-}.instrument(process_span).await;
 ```
 
-**Reaction forwarder task** (Task 3 — same pattern):
-
-```rust
-// reactions/manager.rs — forwarder task
-
-let dispatched_result = receiver.recv().await;
-
-let receive_span = info_span!(
-    "reaction.receive",
-    reaction_id = %reaction_id,
-    query_id = %dispatched_result.query_id,
-);
-
-if let Some(parent) = &dispatched_result.parent_span {
-    receive_span.follows_from(parent);
-}
-
-async {
-    let start = std::time::Instant::now();
-    match reaction.enqueue_query_result(dispatched_result.data).await {
-        Ok(_) => {
-            metrics::histogram!("drasi.reaction.dispatch_duration_ns", "reaction_id" => reaction_id.clone())
-                .record(start.elapsed().as_nanos() as f64);
-        }
-        Err(err) => {
-            metrics::counter!("drasi.reaction.errors", "reaction_id" => reaction_id.clone(), "error_type" => err.variant_name()).increment(1);
-            tracing::error!(error = %err, "Error in reaction enqueue");
-        }
-    }
-}.instrument(receive_span).await;
-```
-
+At each task boundary, the downstream task creates its span and links it to the carried `parent_span` using `follows_from`. This produces the connected trace tree shown in Section 2.
 
 #### 5. Metrics Definitions
 
-**Already tracked internally** (via `PriorityQueueMetrics` atomics or `ProfilingMetadata` timestamps, but not exportable to Prometheus/OTLP — the `metrics` crate bridges them):
+The metrics below are organized by the pipeline interval they measure (see Section 3 diagram).
 
-| Metric | Type | Labels | Existing internal source |
-|--------|------|--------|--------------------------|
-| `drasi.source.events_enqueued` | Counter | `source_id` | `PriorityQueueMetrics.total_enqueued` |
-| `drasi.query.processing_duration_ns` | Histogram | `query_id` | `ProfilingMetadata` per-event timestamps (sampled) |
-| `drasi.query.queue_depth` | Gauge | `query_id` | `PriorityQueueMetrics.current_depth` |
-| `drasi.reaction.dispatch_duration_ns` | Histogram | `reaction_id` | `ProfilingMetadata` per-event timestamps (sampled) |
+**Histograms** (latency/duration — all in nanoseconds):
 
-**New metrics** (not tracked anywhere today):
+| Metric | Labels | Interval | Where Recorded |
+|--------|--------|----------|----------------|
+| `drasi.source.dispatch_duration_ns` | `source_id` | A | `SourceBase::dispatch_source_change()` — time to wrap and dispatch event |
+| `drasi.query.engine_duration_ns` | `query_id` | D | Event processor — time inside `process_source_change()` only |
+| `drasi.query.dispatch_duration_ns` | `query_id` | E | `dispatch_query_results()` — time to convert results + dispatch to channels |
+| `drasi.reaction.enqueue_duration_ns` | `reaction_id`, `query_id` | G (partial) | Reaction forwarder — time for `enqueue_query_result()` |
 
-| Metric | Type | Labels | Where Recorded |
-|--------|------|--------|----------------|
-| `drasi.source.events_received` | Counter | `source_id` | Forwarder task, on each event received from source context channel |
-| `drasi.query.events_processed` | Counter | `query_id` | Event processor loop, after successful `process_source_change` |
-| `drasi.query.errors` | Counter | `query_id`, `error_type` | Event processor loop, on `process_source_change` error |
-| `drasi.reaction.events_dispatched` | Counter | `reaction_id`, `query_id` | `dispatch_query_results()`, per dispatcher call |
-| `drasi.reaction.errors` | Counter | `reaction_id`, `error_type` | Reaction forwarder task, on `enqueue_query_result()` error |
+**Counters** (throughput and errors):
+
+| Metric | Labels | What | Where Recorded |
+|--------|--------|------|----------------|
+| `drasi.source.events_dispatched` | `source_id` | Events dispatched by source | `SourceBase::dispatch_source_change()` |
+| `drasi.query.events_received` | `query_id`, `source_id` | Events received by query forwarder | Query forwarder task on `receiver.recv()` |
+| `drasi.query.events_processed` | `query_id` | Events successfully processed by query engine | Event processor after `process_source_change` returns Ok |
+| `drasi.query.errors` | `query_id`, `error_type` | Query engine errors | Event processor on `process_source_change` error |
+| `drasi.reaction.events_enqueued` | `reaction_id`, `query_id` | Results enqueued to reaction | Reaction forwarder after `enqueue_query_result()` |
+| `drasi.reaction.errors` | `reaction_id`, `error_type` | Reaction enqueue errors | Reaction forwarder on `enqueue_query_result()` error |
 
 #### 6. Interaction with Existing ComponentLogLayer
 
@@ -354,6 +349,68 @@ Create spans only within each task's scope and don't carry trace context through
 
 **Rejected because**: The primary value of distributed tracing is following a single event end-to-end. Three disconnected traces per event makes it impossible to correlate what happened to a specific source change across the pipeline — you'd have to manually match them by timestamp and field values. Carrying a span handle through the channel is a small amount of additional data (one `Arc` clone per event) and standard practice in async Rust applications that use channel-based architectures. The `follows_from` relationship in the `tracing` crate exists specifically for this use case.
 
+## Plugin Observability Across FFI
+
+When sources and reactions are loaded as cdylib dynamic plugins (via `drasi-host-sdk`), they run in a separate shared library with their own tokio runtime and their own `tracing` global subscriber. This creates an FFI boundary that the normal span propagation approach (carrying `tracing::Span` handles through channels, as described in Section 4) cannot cross.
+
+The reason is that `tracing::Span` handles are tied to the subscriber that created them — they reference internal storage in the subscriber's registry. Since the host and each plugin have separate `tracing` dispatchers (each cdylib installs its own global subscriber via `FfiTracingLayer`), a span handle created on one side is meaningless on the other. You cannot pass a `tracing::Span` across the FFI boundary the way you can pass it through an async channel within the same process.
+
+Today, only flat log messages cross the FFI boundary — `FfiTracingLayer` captures tracing events, flattens them to `FfiLogEntry` (level, message, component IDs), and delivers them via a C callback. No span trees, trace IDs, or metrics cross. This means plugin-internal work (e.g., Postgres WAL parsing, HTTP polling, MQTT publishing) is completely invisible to the host's tracing and metrics systems.
+
+To solve this, we use the same approach as distributed tracing between microservices: instead of passing Rust span objects, we pass lightweight **W3C TraceContext identifiers** (`trace_id` + `parent_span_id` — 24 bytes of raw IDs) across the FFI boundary. Each side creates and exports its own spans independently; the tracing backend (Jaeger, Tempo) stitches them together by matching `trace_id`. This is similar to the model used by Drasi Platform on Kubernetes, where trace context flows via Dapr HTTP headers between Source, Query, and Reaction containers.
+
+### Proposed Approach
+
+In this context, the **host** is the application that loads and manages plugins — i.e., drasi-lib's manager layer (or Drasi Server wrapping it). The host runs the pipeline spans (`source.dispatch`, `query.process`, etc.) and owns the `tracing` subscriber and `metrics` recorder. Plugins are the cdylib shared libraries loaded into the host process.
+
+**Part 1: Host-side instrumentation** — all spans/metrics from the Design section run on the host side. Plugin-internal work is not spanned by the host.
+
+**Part 2: Trace context propagation across FFI** — pass W3C TraceContext (`trace_id: [u8; 16]`, `parent_span_id: [u8; 8]`) across FFI via `FfiRuntimeContext` and `FfiResultContext`. Same model as Drasi Platform (K8s) with Dapr trace headers.
+
+| | Drasi Platform (K8s) | drasi-lib (plugins) |
+|---|---|---|
+| Transport | Dapr pub/sub + service invocation | FFI C ABI structs |
+| Trace context carrier | HTTP `traceparent` header / Dapr metadata | `trace_id: [u8; 16]` + `parent_span_id: [u8; 8]` in FFI structs |
+| Who injects | Query-host adds headers to Dapr calls | Host-sdk populates fields when crossing FFI |
+| Who extracts | Source/Reaction container reads headers | Plugin-sdk reads fields via `TelemetryHandle` |
+| Export | Each container has its own OTLP exporter | Each cdylib has its own OTLP exporter |
+
+**Part 3: Plugin metrics forwarding** — add `FfiMetricEntry` + `MetricsCallbackFn` to the vtable. Plugin-sdk installs `FfiMetricsRecorder` that proxies to the host. Metric naming: `drasi.<component_type>.<plugin_kind>.<metric>`.
+
+### Plugin SDK: `TelemetryHandle`
+
+Plugin developers should not need to understand FFI trace context or W3C TraceContext. Following the `StateStoreProvider` pattern, we provide a `TelemetryHandle` via runtime context:
+
+```rust
+pub struct TelemetryHandle { /* internal: trace context + metrics proxy */ }
+
+impl TelemetryHandle {
+    pub fn span(&self, name: &str) -> SpanGuard { /* ... */ }
+    pub fn count(&self, name: &str) { /* ... */ }
+    pub fn count_by(&self, name: &str, value: u64) { /* ... */ }
+    pub fn record_duration_ns(&self, name: &str, nanos: u64) { /* ... */ }
+    pub fn set_gauge(&self, name: &str, value: f64) { /* ... */ }
+    pub fn start_timer(&self, name: &str) -> TimerGuard { /* ... */ }
+}
+```
+
+**Example: Source plugin** — no tracing/metrics imports needed:
+
+```rust
+async fn start(&self) -> Result<()> {
+    let telemetry = self.base.telemetry();
+    loop {
+        let _span = telemetry.span("wal_recv");
+        let _timer = telemetry.start_timer("wal_parse");
+        let changes = self.recv_wal_changes().await?;
+        telemetry.count_by("wal_events", changes.len() as u64);
+        for change in changes { self.dispatch_change(change).await?; }
+    }
+}
+```
+
+Plugin developers write the same code regardless of whether their plugin is built-in or loaded as a cdylib. The `TelemetryHandle` abstracts the difference. For built-in plugins, `span()` delegates directly to `tracing::info_span!()` and `count()` delegates to `metrics::counter!()` — no indirection at all. For cdylib plugins, `span()` takes the `trace_id` and `parent_span_id` that the host passed via `FfiRuntimeContext`, constructs an OpenTelemetry `SpanContext` from those raw IDs, and creates a linked span that the plugin exports via its own OTLP exporter. Similarly, `count()` and `record_duration_ns()` serialize to `FfiMetricEntry` and call the `MetricsCallbackFn` — the host receives it and re-emits through its own `metrics` recorder. The plugin developer never sees any of this plumbing; they just call `telemetry.span()` and `telemetry.count()`, and the right thing happens. This follows the same pattern as `StateStoreProvider`, where plugin devs call `self.base.state_store().get("key")` without knowing whether the backing store is redb, Redis, or in-memory.
+
 ## Security
 
 No new security concerns. Tracing spans and metrics expose operational data (component IDs, event counts, latency) but not user data, credentials, or query content. Span fields use component identifiers that are already visible in logs today.
@@ -390,15 +447,6 @@ This design *is* the telemetry story for drasi-lib. After implementation, the fo
 | Zero-cost when no backend | Unit | Process events without any subscriber/recorder installed; verify no panics, no overhead (benchmark if needed) |
 | End-to-end with OTLP | Manual / Integration | Example app with `tracing-opentelemetry` + Jaeger; verify spans appear in Jaeger UI with correct nesting and fields |
 
-## Development Plan
-
-| Phase | Work Items | Estimate |
-|-------|-----------|----------|
-| 1. Dependencies & scaffolding | Add `metrics = "0.24"` to `Cargo.toml`. Create internal helper module for metric key constants (e.g., `telemetry/mod.rs` with `const QUERY_EVENTS_PROCESSED: &str = "drasi.query.events_processed"`) | Small |
-| 2. Tracing spans | Add spans to `queries/manager.rs` (source.ingest, query.start, query.bootstrap, query.process), `dispatch_query_results()` (reaction.dispatch), `reactions/manager.rs` (reaction.receive). Convert `log::error!()` on error paths to `tracing::error!()` | Medium |
-| 3. Metrics | Add counter/histogram/gauge calls at the same instrumentation points. Wire `PriorityQueue` depth to gauge. | Medium |
-| 4. Tests | Unit tests for span creation and metric recording. Verify ComponentLogLayer compatibility. | Medium |
-| 5. Documentation | Update drasi-lib README / doc comments with observability section. Add code examples for subscriber + recorder setup. | Small |
 
 ## Open Issues
 
@@ -415,6 +463,10 @@ This design *is* the telemetry story for drasi-lib. After implementation, the fo
    - `init_default_subscriber()` — calls `init_component_log_layer()`, composes it with the `fmt` layer, and installs the global subscriber (same behavior as today)
 
    Simple embedders call `init_default_subscriber()` and get current behavior. Drasi Server calls `init_component_log_layer()`, adds the OTLP layer alongside it, and installs its own subscriber. This is a non-breaking change.
+
+6. **Plugin trace context granularity**: Should trace context be passed once at plugin initialization (via `FfiRuntimeContext` — all plugin work shares one parent), or per-event (via `FfiSourceEvent` / `FfiResultContext` — each event links to its specific host span)? Per-event is more accurate but adds 24 bytes per FFI event crossing.
+
+7. **Plugin metrics naming governance**: Plugin metrics use `drasi.<component_type>.<plugin_kind>.<metric>`. Should drasi-lib enforce this prefix in the `FfiMetricsRecorder`, or trust plugin authors to follow the convention? Enforcement prevents namespace collisions but limits flexibility.
 
 ## References
 
