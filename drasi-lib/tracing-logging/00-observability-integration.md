@@ -166,55 +166,32 @@ source.dispatch { source_id=postgres-src, element_id=Order:42 }          ← roo
              └──► reaction.receive { reaction_id=webhook }                 ← same reaction, different query
 ```
 
-All branches share the same `trace_id` with `source.dispatch` as the root. In Jaeger this renders as a single expandable trace tree.
+All branches share the same `trace_id` with `source.dispatch` as the root. In Jaeger this renders as a single expandable trace tree. When no `tracing::Subscriber` is installed, all `info_span!()` calls compile to no-ops — zero allocation, zero cost. When a subscriber is installed, the cost is proportional to the pipeline topology that the user explicitly configured. Each span is ~200 bytes in a typical subscriber (span name + fields + timestamps).
 
-**Overhead**: When no `tracing::Subscriber` is installed, all `info_span!()` calls compile to no-ops — zero allocation, zero cost. When a subscriber is installed, the cost is proportional to the pipeline topology that the user explicitly configured. Each span is ~200 bytes in a typical subscriber (span name + fields + timestamps).
+#### 3. Pipeline Stages and Instrumentation Points
 
-#### 3. Pipeline Stages, Intervals, and Instrumentation Points
-
-Before choosing where to place spans and metrics, we first enumerate the actual pipeline stages and the time intervals we want to capture. The pipeline runs across multiple tokio tasks connected by channels and priority queues:
+The pipeline runs across 5 tokio tasks connected by channels and priority queues. Each arrow (`──▶`) crosses a task boundary:
 
 ```
-                        ┌─────────────────────────────────────────────────────────────────────┐
-                        │                     Per-Query Pipeline                               │
-                        │                                                                     │
-  Source Plugin         │  Task: query          Task: query           Task: query result       │  Task: reaction
-  (user code)           │  forwarder            processor             dispatch (same task)     │  forwarder
-                        │                                                                     │
-  ┌──────────┐    ┌─────┼───────────┐    ┌──────────────┐    ┌──────────────────────┐    ┌────┼──────────────┐    ┌──────────────┐
-  │ Source    │    │     │ Dispatcher│    │              │    │                      │    │    │ Dispatcher   │    │              │
-  │ dispatch_ │───▶│ ChangeReceiver │───▶│ PriorityQueue│───▶│ process_source_change│───▶│ ChangeReceiver  │───▶│ Reaction     │
-  │ event()   │    │     │ (channel/ │    │ (timestamp-  │    │ (drasi-core engine)  │    │    │ (channel/    │    │ PriorityQueue│
-  └──────────┘    │     │  bcast)   │    │  ordered)    │    │                      │    │    │  bcast)      │    │ + processing │
-                  │     └───────────┘    └──────────────┘    └──────────────────────┘    │    └──────────────┘    └──────────────┘
-                  │                                                                     │
-       ▲          └─────────────────────────────────────────────────────────────────────┘          ▲
-       │                                                                                          │
-       │  Interval A      B          C              D                E          F          G      │
-       └──────────────────────────────────────────────────────────────────────────────────────────┘
-
-  A: Source dispatch       — time for source to dispatch event to channel(s)
-  B: Source→Query channel  — time event waits in dispatcher channel (backpressure visible here)
-  C: Query PQueue wait     — time event waits in priority queue (ordering + backpressure)
-  D: Query engine          — time spent in ContinuousQuery::process_source_change()
-  E: Result conversion     — time to convert results + dispatch to reaction channel(s)
-  F: Query→Reaction channel — time result waits in dispatcher channel
-  G: Reaction PQueue + processing — time in reaction's priority queue + reaction plugin processing
+Source Plugin ──▶ Query Forwarder ──▶ Query Processor ──▶ Reaction Forwarder ──▶ Reaction Processor
+   (T1)              (T2)               (T3)                  (T4)                  (T5)
+     │                 │                  │                      │                    │
+  dispatch          channel →         PQueue →              channel →            PQueue →
+  event to          PQueue           process +               reaction            reaction
+  channel(s)                         dispatch                PQueue              processing
+     │                 │                  │                      │                    │
+  Interval A      Interval B+C       Interval D+E           Interval F           Interval G
 ```
 
-**Task boundaries** (each `──▶` through a channel/queue crosses a tokio task boundary):
+**Intervals we want to capture**:
 
-| # | Task | Spawned by | What it does |
-|---|------|------------|-------------|
-| T1 | Source plugin task | User code / Source::start() | Calls `SourceBase::dispatch_event()` |
-| T2 | Query forwarder (1 per source per query) | `DrasiQuery::start()` | Receives from `ChangeReceiver`, enqueues to query `PriorityQueue` |
-| T3 | Query event processor (1 per query) | `DrasiQuery::start()` | Dequeues from `PriorityQueue`, calls `process_source_change`, dispatches results |
-| T4 | Reaction forwarder (1 per query per reaction) | `ReactionManager::subscribe_reaction_to_queries()` | Receives from `ChangeReceiver`, enqueues to reaction `PriorityQueue` |
-| T5 | Reaction processor (1 per reaction) | `Reaction::start()` | Dequeues from reaction `PriorityQueue`, processes results |
-
-**Fan-out points** — a single source event can fan out at two points:
-- **Source → Queries**: One source can feed N queries (1 dispatcher channel per query in Channel mode, or 1 shared broadcast)
-- **Query → Reactions**: One query result can feed M reactions (1 dispatcher channel per reaction in Channel mode, or 1 shared broadcast)
+- **A**: Source dispatch — time for source to wrap event and send to channel(s)
+- **B**: Source→Query channel wait — time event sits in dispatcher channel
+- **C**: Query PQueue wait — time event waits in priority queue for processor
+- **D**: Query engine — time inside `process_source_change()`
+- **E**: Result dispatch — time to convert results and send to reaction channels
+- **F**: Query→Reaction channel wait — time result sits in dispatcher channel
+- **G**: Reaction enqueue + processing — time in reaction's priority queue + plugin processing
 
 #### 4. Trace Context Propagation Across Channels
 
@@ -226,7 +203,6 @@ Trace context needs to cross two types of channel boundaries:
 1. **ChangeDispatcher** (T1→T2 source events, T3→T4 query results) — dispatches `Arc<T>` directly
 2. **PriorityQueue** (T2→T3, T4→T5) — wraps `Arc<T>` in `PriorityQueueEvent<T>`
 
-The event types (`SourceEventWrapper`, `QueryResult`) are `Arc`-wrapped for zero-copy: multiple consumers reference the same allocation without cloning the payload. **The `parent_span` must not break this zero-copy property.**
 
 **Design**: Use different strategies for each boundary:
 
@@ -297,63 +273,19 @@ The `ComponentLogLayer` is preserved unchanged. It operates as a `tracing_subscr
 - The `ComponentLogRegistry` API (`subscribe_component_logs()`, `subscribe_component_events()`) continues to work as before.
 - If the embedding application adds additional `tracing::Subscriber` layers (e.g., `tracing-opentelemetry`), spans flow to both `ComponentLogLayer` AND the external backend. This is standard `tracing` layer composition.
 
-#### Advantages
+##### Advantages
 
 - **Zero-cost by default**: No overhead when no subscriber/recorder is installed — facade calls compile to no-ops
 - **No breaking changes**: Existing `ComponentLogLayer`, `log` crate usage, and public API are unchanged
 - **Standard ecosystem**: Uses `tracing` and `metrics` — the dominant Rust observability crates — enabling direct integration with Jaeger, Prometheus, Datadog, OTLP, etc.
 - **Composable**: Multiple subscribers/recorders can coexist. `ComponentLogLayer` + `tracing_opentelemetry` + `fmt` all work together
 
-#### Disadvantages
 
-- **New dependency**: `metrics` crate adds ~15KB to compile. Minimal runtime cost but increases dependency tree.
-- **No built-in backend**: Developers must bring their own subscriber/recorder setup. This is intentional (library should not dictate backend) but adds friction for quick-start use cases.
-
-### API Design
-
-N/A — no changes to the public `DrasiLib` builder API, REST API, or CLI. The instrumentation is purely internal to drasi-lib's pipeline implementation. All new tracing spans and metrics are emitted through facade crates and are transparent to the public API.
-
-### Alternatives Considered
-
-#### 1. Use OpenTelemetry SDK Directly (Instead of Facade Crates)
-
-Instrument drasi-lib directly with `opentelemetry` crate APIs (`tracer.start("span")`, `meter.u64_counter()`).
-
-**Rejected because**: This would hard-couple drasi-lib to the OpenTelemetry SDK, requiring all embedding applications to use OTel. The facade approach (`tracing` + `metrics`) lets users choose any backend. This is also the approach used by the broader Rust ecosystem — libraries use facades, applications choose backends.
-
-#### 2. Replace `log` Crate Usage with `tracing` Events Everywhere
-
-Convert all existing `log::info!()`, `log::error!()` calls to `tracing::info!()`, `tracing::error!()`.
-
-**Deferred**: This would be a nice cleanup but is not necessary for this design. The `tracing-log` bridge already forwards `log` events to the `tracing` subscriber. We can do this incrementally as we touch files.
-
-#### 3. Add `#[instrument]` to All Public Functions
-
-Automatically create spans for every public function using the `#[instrument]` attribute.
-
-**Rejected because**: This creates too many fine-grained spans that add noise and overhead. The pipeline boundary approach (source ingest → query process → reaction dispatch) gives the right level of granularity for debugging and monitoring.
-
-#### 4. Embed Metrics in ComponentLogLayer
-
-Extend the existing `ComponentLogLayer` to also track counters and histograms internally rather than adding the `metrics` crate.
-
-**Rejected because**: `ComponentLogLayer` is a log routing mechanism, not a metrics system. The `metrics` crate provides the standard Rust interface for counters/histograms/gauges with ecosystem support for exporters. Mixing concerns in `ComponentLogLayer` would make it harder to maintain.
-
-#### 5. Independent Spans Per Task (No Cross-Channel Trace Linking)
-
-Create spans only within each task's scope and don't carry trace context through the PriorityQueue or ChangeDispatcher channels. Each task would create a root span, producing 3 disconnected traces per event:
-
-- **Trace A**: `source.ingest` (source forwarder task)
-- **Trace B**: `query.process` → `reaction.dispatch` (event processor task)
-- **Trace C**: `reaction.receive` (reaction forwarder task)
-
-**Rejected because**: The primary value of distributed tracing is following a single event end-to-end. Three disconnected traces per event makes it impossible to correlate what happened to a specific source change across the pipeline — you'd have to manually match them by timestamp and field values. Carrying a span handle through the channel is a small amount of additional data (one `Arc` clone per event) and standard practice in async Rust applications that use channel-based architectures. The `follows_from` relationship in the `tracing` crate exists specifically for this use case.
-
-## Plugin Observability Across FFI
+#### 7. Plugin Observability Across FFI
 
 When sources and reactions are loaded as cdylib dynamic plugins (via `drasi-host-sdk`), they run in a separate shared library with their own tokio runtime and their own `tracing` global subscriber. This creates an FFI boundary that the normal span propagation approach (carrying `tracing::Span` handles through channels, as described in Section 4) cannot cross.
 
-The reason is that `tracing::Span` handles are tied to the subscriber that created them — they reference internal storage in the subscriber's registry. Since the host and each plugin have separate `tracing` dispatchers (each cdylib installs its own global subscriber via `FfiTracingLayer`), a span handle created on one side is meaningless on the other. You cannot pass a `tracing::Span` across the FFI boundary the way you can pass it through an async channel within the same process.
+The reason is that `tracing::Span` handles are tied to the subscriber that created them — they reference internal storage in the subscriber's registry. You cannot pass a `tracing::Span` across the FFI boundary the way you can pass it through an async channel within the same process.
 
 Today, only flat log messages cross the FFI boundary — `FfiTracingLayer` captures tracing events, flattens them to `FfiLogEntry` (level, message, component IDs), and delivers them via a C callback. No span trees, trace IDs, or metrics cross. This means plugin-internal work (e.g., Postgres WAL parsing, HTTP polling, MQTT publishing) is completely invisible to the host's tracing and metrics systems.
 
@@ -410,6 +342,48 @@ async fn start(&self) -> Result<()> {
 ```
 
 Plugin developers write the same code regardless of whether their plugin is built-in or loaded as a cdylib. The `TelemetryHandle` abstracts the difference. For built-in plugins, `span()` delegates directly to `tracing::info_span!()` and `count()` delegates to `metrics::counter!()` — no indirection at all. For cdylib plugins, `span()` takes the `trace_id` and `parent_span_id` that the host passed via `FfiRuntimeContext`, constructs an OpenTelemetry `SpanContext` from those raw IDs, and creates a linked span that the plugin exports via its own OTLP exporter. Similarly, `count()` and `record_duration_ns()` serialize to `FfiMetricEntry` and call the `MetricsCallbackFn` — the host receives it and re-emits through its own `metrics` recorder. The plugin developer never sees any of this plumbing; they just call `telemetry.span()` and `telemetry.count()`, and the right thing happens. This follows the same pattern as `StateStoreProvider`, where plugin devs call `self.base.state_store().get("key")` without knowing whether the backing store is redb, Redis, or in-memory.
+
+
+### API Design
+
+N/A — no changes to the public `DrasiLib` builder API, REST API, or CLI. The instrumentation is purely internal to drasi-lib's pipeline implementation. All new tracing spans and metrics are emitted through facade crates and are transparent to the public API.
+
+### Alternatives Considered
+
+#### 1. Use OpenTelemetry SDK Directly (Instead of Facade Crates)
+
+Instrument drasi-lib directly with `opentelemetry` crate APIs (`tracer.start("span")`, `meter.u64_counter()`).
+
+**Rejected because**: This would hard-couple drasi-lib to the OpenTelemetry SDK, requiring all embedding applications to use OTel. The facade approach (`tracing` + `metrics`) lets users choose any backend. This is also the approach used by the broader Rust ecosystem — libraries use facades, applications choose backends.
+
+#### 2. Replace `log` Crate Usage with `tracing` Events Everywhere
+
+Convert all existing `log::info!()`, `log::error!()` calls to `tracing::info!()`, `tracing::error!()`.
+
+**Deferred**: This would be a nice cleanup but is not necessary for this design. The `tracing-log` bridge already forwards `log` events to the `tracing` subscriber. We can do this incrementally as we touch files.
+
+#### 3. Add `#[instrument]` to All Public Functions
+
+Automatically create spans for every public function using the `#[instrument]` attribute.
+
+**Rejected because**: This creates too many fine-grained spans that add noise and overhead. The pipeline boundary approach (source ingest → query process → reaction dispatch) gives the right level of granularity for debugging and monitoring.
+
+#### 4. Embed Metrics in ComponentLogLayer
+
+Extend the existing `ComponentLogLayer` to also track counters and histograms internally rather than adding the `metrics` crate.
+
+**Rejected because**: `ComponentLogLayer` is a log routing mechanism, not a metrics system. The `metrics` crate provides the standard Rust interface for counters/histograms/gauges with ecosystem support for exporters. Mixing concerns in `ComponentLogLayer` would make it harder to maintain.
+
+#### 5. Independent Spans Per Task (No Cross-Channel Trace Linking)
+
+Create spans only within each task's scope and don't carry trace context through the PriorityQueue or ChangeDispatcher channels. Each task would create a root span, producing 3 disconnected traces per event:
+
+- **Trace A**: `source.ingest` (source forwarder task)
+- **Trace B**: `query.process` → `reaction.dispatch` (event processor task)
+- **Trace C**: `reaction.receive` (reaction forwarder task)
+
+**Rejected because**: The primary value of distributed tracing is following a single event end-to-end. Three disconnected traces per event makes it impossible to correlate what happened to a specific source change across the pipeline — you'd have to manually match them by timestamp and field values. Carrying a span handle through the channel is a small amount of additional data (one `Arc` clone per event) and standard practice in async Rust applications that use channel-based architectures. The `follows_from` relationship in the `tracing` crate exists specifically for this use case.
+
 
 ## Security
 
