@@ -294,12 +294,6 @@ Today, only flat log messages cross the FFI boundary — `FfiTracingLayer` captu
 
 All three telemetry signals — logs, metrics, and traces — use the same architecture: the plugin serializes telemetry data into a flat C-compatible struct and sends it to the host via a callback function pointer on the vtable. The host receives it and routes it through its own subscriber/recorder. This gives the host full control over filtering, sampling, and export.
 
-| Signal | FFI struct | Callback | Host action |
-|--------|-----------|----------|-------------|
-| **Logs** (existing) | `FfiLogEntry` | `LogCallbackFn` | Re-emits via `log::log!()`, routes to `ComponentLogRegistry` |
-| **Metrics** (new) | `FfiMetricEntry` | `MetricsCallbackFn` | Re-emits via `metrics::counter!()` / `metrics::histogram!()` |
-| **Traces** (new) | `FfiCompletedSpan` | `SpanCallbackFn` | Feeds into host's `tracing` subscriber for export via OTLP |
-
 In this context, the **host** is the application that loads and manages plugins — i.e., drasi-lib's manager layer (or Drasi Server wrapping it). The host runs the pipeline spans (`source.dispatch`, `query.process`, etc.) and owns the single `tracing` subscriber, `metrics` recorder, and OTLP exporter. Plugins are the cdylib shared libraries loaded into the host process — they do not have their own exporters.
 
 **Part 1: Host-side instrumentation** — all pipeline spans/metrics from Sections 2–6 run on the host side. These are automatic and require no plugin code.
@@ -331,7 +325,7 @@ source.dispatch { source_id=postgres-src }         ← host
                  └── mqtt_publish { topic=orders }  ← reaction plugin, via callback
 ```
 
-All spans share the same `trace_id` and flow through the host's single OTLP exporter.
+All spans share the same `trace_id` and flow through the host's single OTLP exporter. Spans created under a host-injected `parent_span_id` (i.e., pipeline-related work like `wal_parse` during `dispatch_change()`) are accepted as children of the pipeline trace. Any additional spans the plugin creates outside of a host-injected context are emitted as their own separate traces, keeping the Drasi pipeline trace clean.
 
 **Part 3: Plugin metrics forwarding** — add `FfiMetricEntry` + `MetricsCallbackFn` to the vtable. Plugin-sdk installs `FfiMetricsRecorder` that proxies to the host's single `metrics::Recorder`. Metric naming: `drasi.<component_type>.<plugin_kind>.<metric>`.
 
@@ -475,8 +469,6 @@ This design *is* the telemetry story for drasi-lib. After implementation, the fo
 6. **Plugin trace context granularity**: Should trace context be passed per-event (each `dispatch_change()` / reaction invocation carries the current `trace_id` + `parent_span_id`) or once at plugin initialization? Per-event links each plugin span to its specific pipeline event. Per-init is simpler but all plugin work shares one parent span.
 
 7. **Plugin metrics naming governance**: Plugin metrics use `drasi.<component_type>.<plugin_kind>.<metric>`. Should drasi-lib enforce this prefix in the `FfiMetricsRecorder`, or trust plugin authors to follow the convention? Enforcement prevents namespace collisions but limits flexibility.
-
-8. **Plugin span filtering**: With the centralized callback approach, the host receives all plugin spans via `SpanCallbackFn`. Should drasi-lib provide a default filtering policy (e.g., drop spans shorter than a threshold, cap spans per second per plugin) or leave filtering entirely to the embedding application's subscriber configuration?
 
 ## References
 
