@@ -331,45 +331,35 @@ All spans share the same `trace_id` and flow through the host's single OTLP expo
 
 **Why centralized export matters**: With third-party source plugins, Drasi needs control over what telemetry is exported. The callback approach ensures the host can filter, sample, or drop plugin spans and metrics before they reach the OTLP exporter — plugins cannot emit telemetry that bypasses the host.
 
-### Plugin SDK: `TelemetryHandle`
+### Plugin Developer Experience: Transparent Bridge
 
-Plugin developers should not need to understand FFI trace context or W3C TraceContext. Following the `StateStoreProvider` pattern, we provide a `TelemetryHandle` via runtime context:
+Plugin developers use standard Rust `tracing` and `metrics` macros — no custom API needed. The plugin SDK transparently installs bridge implementations that intercept standard calls and forward them to the host:
 
-```rust
-pub struct TelemetryHandle { /* internal: trace context + metrics proxy */ }
+| Signal | Bridge installed by plugin SDK | Plugin dev uses | How it forwards |
+|--------|-------------------------------|----------------|-----------------|
+| **Logs** (existing) | `FfiTracingLayer` | `tracing::info!()`, `tracing::error!()` | Intercepts events → `FfiLogEntry` → `LogCallbackFn` |
+| **Metrics** (new) | `FfiMetricsRecorder` | `metrics::counter!()`, `metrics::histogram!()` | Intercepts recordings → `FfiMetricEntry` → `MetricsCallbackFn` |
+| **Traces** (new) | Extended `FfiTracingLayer` | `tracing::info_span!()` | Intercepts span open/close → `FfiCompletedSpan` → `SpanCallbackFn` |
 
-impl TelemetryHandle {
-    pub fn span(&self, name: &str) -> SpanGuard { /* ... */ }
-    pub fn count(&self, name: &str) { /* ... */ }
-    pub fn count_by(&self, name: &str, value: u64) { /* ... */ }
-    pub fn record_duration_ns(&self, name: &str, nanos: u64) { /* ... */ }
-    pub fn set_gauge(&self, name: &str, value: f64) { /* ... */ }
-    pub fn start_timer(&self, name: &str) -> TimerGuard { /* ... */ }
-}
-```
+For trace context injection, the host sets `trace_id` + `parent_span_id` via task-local storage before each FFI call. The bridge layer reads it when a span is created and includes it in the `FfiCompletedSpan` sent back to the host. This is fully transparent to the plugin developer.
 
-
-**Example: Source plugin** — no tracing/metrics imports needed:
+**Example: Source plugin** — standard `tracing` + `metrics` macros:
 
 ```rust
+use tracing::info_span;
+use metrics::counter;
+
 async fn start(&self) -> Result<()> {
-    let telemetry = self.base.telemetry();
     loop {
-        let _span = telemetry.span("wal_recv");
-        let _timer = telemetry.start_timer("wal_parse");
+        let _span = info_span!("wal_recv");
         let changes = self.recv_wal_changes().await?;
-        telemetry.count_by("wal_events", changes.len() as u64);
+        counter!("wal_events").increment(changes.len() as u64);
         for change in changes { self.dispatch_change(change).await?; }
     }
 }
 ```
 
-Plugin developers write the same code regardless of whether their plugin is built-in or loaded as a cdylib. The `TelemetryHandle` abstracts the difference:
-
-- **Built-in plugins**: `span()` delegates directly to `tracing::info_span!()`, `count()` to `metrics::counter!()` — no indirection.
-- **cdylib plugins**: `span()` creates a span locally using the host-injected `trace_id`/`parent_span_id`; on close, it serializes to `FfiCompletedSpan` and calls back to the host via `SpanCallbackFn`. `count()` and `record_duration_ns()` serialize to `FfiMetricEntry` and call `MetricsCallbackFn`.
-
-In both cases, telemetry flows through the host's single subscriber/recorder — plugins never need their own exporter. This follows the same pattern as `StateStoreProvider`, where plugin devs call `self.base.state_store().get("key")` without knowing the backing store.
+This works identically for built-in and cdylib plugins. For built-in plugins, the macros go directly to the host's subscriber/recorder. For cdylib plugins, the bridge implementations intercept and forward via callbacks. The plugin developer never sees the difference.
 
 
 ### API Design
