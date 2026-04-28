@@ -69,7 +69,7 @@ The design must accommodate all of these without forcing native positions into a
 
 - **Checkpoint-Based Recovery (docs 00–03):** This document is an amendment to the existing checkpoint design. The nested transaction model, `CheckpointWriter` trait, position handles, and recovery policies from docs 00–03 remain in effect. This document modifies the types that flow through those mechanisms.
 - **Result Index (drasi-core):** The `ResultSequenceCounter` trait and its RocksDB/Garnet implementations are extended to carry source position bytes.
-- **Source SDKs (Rust, Java, .NET):** The `SourceEventWrapper` type and subscription protocol are modified. SDK updates are required for source plugins to adopt the new position field.
+- **Source plugins:** The `SourceEventWrapper` type and subscription protocol are modified. Each source plugin (Postgres, MSSQL, etc.) must be updated to adopt the new position field.
 - **FFI boundary:** The `FfiSourceEvent` type must be extended with an optional byte buffer for `source_position` (see Open Issues).
 
 ### Out of scope
@@ -362,10 +362,10 @@ Have the framework assign sequences and maintain a mapping table from sequence t
 
 ## Compatibility impact
 
-This proposal modifies the `SourceEventWrapper` structure and `SourceSubscriptionSettings`, which are used across the source SDKs (Rust, Java, .NET). Changes required:
+This proposal modifies the `SourceEventWrapper` structure and `SourceSubscriptionSettings`, which are shared types in the framework. Changes required:
 
-- **Rust SDK**: Direct type change. `sequence` becomes framework-assigned (sources no longer set it). New `source_position: Option<Bytes>` field added.
-- **Java/.NET SDKs**: `resume_from` changes from `long?` to `byte[]?`. Source plugins must be updated to provide and interpret position bytes.
+- **Framework types**: `sequence` becomes framework-assigned (sources no longer set it). New `source_position: Option<Bytes>` field added. `resume_from` in subscription settings changes from `Option<u64>` to `Option<Vec<u8>>`.
+- **Source plugins**: Each source plugin (Postgres, MSSQL, etc.) must be updated to provide `source_position` bytes and interpret `resume_from` bytes in `subscribe()`.
 - **FFI boundary**: `FfiSourceEvent` needs an optional byte buffer field for `source_position`.
 
 Existing source plugins that currently set `sequence` will need migration:
