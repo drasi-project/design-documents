@@ -425,10 +425,7 @@ For each test run, the report should capture:
 
 2. **Correctness verification.** A post-run step compares the JsonlFile output against golden files. For model-generated tests with fixed seeds, the output should be deterministic — any difference is a failure. The comparison tool should report which records differ (added, missing, or changed fields) to make debugging easier.
 
-3. **CI integration.** In GitHub Actions, the `test-report.json` can be:
-   - Uploaded as a build artifact for historical tracking
-   - Parsed by a step that posts a summary comment on the PR (throughput, latency, pass/fail)
-   - Fed into a trend-tracking system (e.g., GitHub Actions cache or an external dashboard) to detect performance regressions over time
+3. **CI integration.** In GitHub Actions, the recommended approach is to use `$GITHUB_STEP_SUMMARY` to render a Markdown results table directly on the workflow run's Summary tab. A post-run step parses `test-report.json` and writes key metrics (status, throughput, latency, correctness) into the summary. This is visible immediately without downloading artifacts. The raw `test-report.json` and logger output files should also be uploaded as build artifacts for historical tracking and debugging.
 
 4. **Regression detection.** For performance metrics, we can define thresholds (e.g., throughput must not drop below 80% of baseline, p99 latency must not exceed 2x baseline). The CI step compares the current run's `test-report.json` against a stored baseline and fails if thresholds are breached. Baselines are updated explicitly (not automatically) to avoid ratcheting.
 
