@@ -1037,9 +1037,6 @@ drasi server restart
 | Complexity | State machine, rollback, crash recovery, dual-load | File download + restart |
 | Risk | Segfaults, partial migration, stuck states | Clean process restart — no new failure modes |
 | Rollback | Complex (needs `retiring` map, old factory) | Keep old binary on disk, restart with it |
-| Discoverability | Operator must know binary path or registry reference | UI shows available updates with changelogs |
-| Timing control | Upgrade happens immediately (pressure to get it right) | Operator chooses when to restart |
-| Validation | ABI check at upgrade time | ABI check at download time — fail early, before restart |
 
 ### Registry Design (Sketch)
 
