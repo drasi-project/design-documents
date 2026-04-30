@@ -436,16 +436,37 @@ For each test run, the report should capture:
 
 ## Additional Notes
 
-### Replace Script-Based Test Sources with the Script File Bootstrapper
+### Replace ETF Script Bootstrap with the Drasi `scriptfile` Bootstrap Provider
 
-The current ETF uses `Script` kind sources to load bootstrap data from script files. Drasi Server (and drasi-platform) now support a `scriptfile` bootstrap provider that loads initial data from JSONL files directly at the source level:
+Today, when a test uses recorded data (as opposed to model-generated data), the ETF handles bootstrapping itself: the `Script` kind source has a `bootstrap_data_generator` that reads script files and dispatches them as source change events through the ETF's dispatchers. This means the ETF is responsible for converting script data into the right format, managing the bootstrap phase, and coordinating the handoff to streaming changes. The Drasi engine (drasi-lib or drasi-server) sees these as regular source change events — it has no awareness that a bootstrap is happening.
+
+Drasi Server and drasi-lib now support a native `scriptfile` bootstrap provider — a Drasi plugin that loads initial data from JSONL files directly during query startup, before streaming begins:
 
 ```yaml
-bootstrapProvider:
-  kind: scriptfile
-  filePaths:
-    - /data/initial_nodes.jsonl
-    - /data/initial_relations.jsonl
+# Drasi server-config.yaml or embedded drasi config
+sources:
+  - id: facilities-db
+    source_type: application
+    auto_start: true
+    bootstrapProvider:
+      kind: scriptfile
+      filePaths:
+        - /data/initial_nodes.jsonl
+        - /data/initial_relations.jsonl
 ```
 
-The JSONL format uses typed records (`Header`, `Node`, `Relation`, `Finish`). Any source kind can use this bootstrap provider — it is independent of the source type. This replaces the need for the ETF to manage bootstrap data injection via script sources, and instead lets the Drasi runtime handle bootstrapping natively. The ETF's `Script` source `bootstrap_data_generator` should be adapted to generate JSONL files in the `scriptfile` provider format, which the embedded or external Drasi server then consumes directly during query startup.
+The JSONL format uses typed records (`Header`, `Node`, `Relation`, `Finish`). Any source kind can use this bootstrap provider — it decouples bootstrap data loading from the source type.
+
+For drasi-lib and drasi-server tests, we should migrate from the ETF's `Script` bootstrap mechanism to the native `scriptfile` bootstrap provider. This has several advantages:
+
+- **Tests the real bootstrap path.** When users deploy Drasi with a `scriptfile` bootstrap, the query engine loads data through the same code path the test exercises. The current ETF approach tests a synthetic path that no real deployment uses.
+- **Simpler ETF config.** The ETF no longer needs a `bootstrap_data_generator` for these tests — it only handles streaming changes after bootstrap. The Drasi engine owns the full bootstrap lifecycle.
+- **Consistent with production.** The `scriptfile` provider handles format parsing, element construction, and bootstrap sequencing. Testing through it validates that pipeline end-to-end.
+
+For drasi-platform (Kubernetes), the `scriptfile` provider is harder to use because the JSONL files need to be accessible from within the pod (e.g., via a ConfigMap, PersistentVolume, or init container). The ETF's current approach of streaming bootstrap data through dispatchers remains more practical for platform tests.
+
+The migration involves:
+1. Converting existing ETF bootstrap script files to the `scriptfile` JSONL format (`Header`, `Node`, `Relation`, `Finish` records)
+2. Adding `bootstrapProvider: { kind: scriptfile, filePaths: [...] }` to the Drasi engine config files (`drasi-memory.yaml`, `server-config.yaml`, etc.)
+3. Removing the `bootstrap_data_generator` block from the ETF's source config for these tests
+4. Hosting the JSONL bootstrap files locally in the repo (for drasi-lib/server) or on Hugging Face Hub (for larger datasets)
