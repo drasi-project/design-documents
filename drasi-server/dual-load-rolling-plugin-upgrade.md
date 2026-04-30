@@ -1100,32 +1100,4 @@ drasi server restart
 
 This is simpler than in-process rollback because the server is in a clean state — no partial migrations, no mixed-version components, no `retiring` maps.
 
----
 
-## Open issues
-
-**Q1: Cross-instance coordination**
-A plugin is loaded server-wide. If the server has multiple DrasiLib instances, does the upgrade plan coordinate across all instances, or do operators upgrade per-instance?
-*Recommendation*: Server-wide (single UpgradePlan covers all instances).
-
-**Q2: Concurrent upgrades of different plugins**
-Can two different plugins be upgraded simultaneously?
-*Recommendation*: Yes — each UpgradePlan is independent. Only one upgrade per plugin at a time.
-
-**Q3: Automatic vs. manual triggering**
-Should the hot-reload watcher be able to trigger an automatic rolling upgrade when it detects a new binary?
-*Recommendation*: Not in v1. Add as opt-in later (`autoUpgrade: true` in config).
-
-**Q4: Plugin state migration**
-If plugin internal state format changes between versions, who migrates?
-*Recommendation*: The plugin itself, via an optional `migrate_state(old_version, state_store) -> Result<()>` hook in the plugin interface. If not implemented, state is wiped and the component re-bootstraps.
-
-**Q5: Timeout per component**
-How long should the system wait for a single component upgrade before declaring failure?
-*Recommendation*: Configurable with a default of 60 seconds (covers stop + initialize + start).
-
-**Q6: Plugin registry hosting**
-Where is the plugin registry hosted? Options: GitHub Releases (already used for Drasi releases), OCI registry (container-native), or a dedicated Drasi plugin registry service.
-
-**Q7: Staged binary validation**
-Should the server validate staged binaries on download (fail-fast) or only on startup promotion? Download-time validation gives earlier feedback but requires the server to be running.
