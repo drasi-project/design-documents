@@ -973,3 +973,159 @@ Even with the `mem::forget` mitigation (never unload), the hot upgrade path stil
 ### Conclusion
 
 Hot plugin upgrades are a **nice-to-have** feature that introduces **must-not-have** risk characteristics. The operational benefit (avoiding a few seconds of source interruption) does not justify the complexity, testing burden, and failure-mode surface area. Drasi's existing architecture — cursor-based resumption and query resilience to source gaps — already provides the availability guarantees that hot upgrades aim to deliver.
+
+---
+
+## Alternative: Registry-Driven Upgrade UX
+
+Rather than hot-swapping plugins at runtime, a more pragmatic approach is to invest in **upgrade UX** — making it trivial for operators to discover, download, and stage new plugin versions, with the actual upgrade applied on the next server restart.
+
+### User Experience
+
+The operator's workflow becomes:
+
+1. **Browse** available plugin updates from a registry (via VS Code extension, CLI, or web UI)
+2. **Download** the new binary to the server's plugin directory (staged, not yet active)
+3. **Review** what will change — which components use this plugin, what version they're on
+4. **Restart** the server at a convenient time — new plugin activates automatically on startup
+
+This separates the **decision** (which version to run) from the **mechanism** (restarting the server), giving operators full control over timing without requiring complex in-process machinery.
+
+### VS Code Extension Integration
+
+The Drasi VS Code extension could provide a plugin management panel:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Drasi Plugins                                       │
+├─────────────────────────────────────────────────────┤
+│  ● source-postgres    v1.0.0  →  v2.1.0 available  │
+│    [View Changelog]  [Download]                      │
+│                                                      │
+│  ● source-mongodb     v1.2.0  (up to date)          │
+│                                                      │
+│  ● reaction-webhook   v0.9.0  →  v1.0.0 available  │
+│    [View Changelog]  [Download]                      │
+│                                                      │
+│  Staged Updates: 1 pending                           │
+│    source-postgres v2.1.0 — applies on next restart  │
+│                                                      │
+│  [Restart Server Now]  [Schedule Restart]            │
+└─────────────────────────────────────────────────────┘
+```
+
+### CLI Equivalent
+
+```bash
+# Browse available updates
+drasi plugin list --check-updates
+
+# Download (stage) a new version
+drasi plugin download source-postgres --version 2.1.0
+
+# See what's staged
+drasi plugin status
+
+# Apply (restart)
+drasi server restart
+```
+
+### Why This Is Better Than Hot Upgrades
+
+| Concern | Hot Upgrade | Registry + Restart |
+|---------|------------|-------------------|
+| Complexity | State machine, rollback, crash recovery, dual-load | File download + restart |
+| Risk | Segfaults, partial migration, stuck states | Clean process restart — no new failure modes |
+| Rollback | Complex (needs `retiring` map, old factory) | Keep old binary on disk, restart with it |
+| Discoverability | Operator must know binary path or registry reference | UI shows available updates with changelogs |
+| Timing control | Upgrade happens immediately (pressure to get it right) | Operator chooses when to restart |
+| Validation | ABI check at upgrade time | ABI check at download time — fail early, before restart |
+
+### Registry Design (Sketch)
+
+A plugin registry serves metadata and binaries:
+
+```
+GET /v1/plugins/source-postgres/versions
+→ [{ "version": "2.1.0", "sdk_abi": "0.6", "changelog": "...", "checksum": "sha256:..." }]
+
+GET /v1/plugins/source-postgres/versions/2.1.0/binary?target=aarch64-apple-darwin
+→ (binary download)
+```
+
+The server's plugin directory would have a `staged/` subdirectory:
+
+```
+plugins/
+├── active/
+│   ├── source-postgres-1.0.0.so
+│   └── reaction-webhook-0.9.0.so
+└── staged/
+    └── source-postgres-2.1.0.so    ← downloaded, not yet active
+```
+
+On startup, the server checks `staged/` — if a newer version of a plugin exists there, it promotes it to `active/` and loads it. The old binary is moved to `archive/` for rollback.
+
+### Startup Promotion Logic
+
+```rust
+// On server startup, before loading plugins:
+for staged_binary in scan_staged_dir()? {
+    let metadata = load_plugin_metadata(&staged_binary)?;
+    let active_path = active_dir.join(&metadata.filename());
+    
+    // Validate ABI compatibility with server
+    validate_server_abi(&metadata)?;
+    
+    // Archive current version for rollback
+    if let Some(current) = find_active_plugin(&metadata.kind) {
+        archive_plugin(&current)?;
+    }
+    
+    // Promote staged → active
+    fs::rename(&staged_binary, &active_path)?;
+    log::info!("Promoted {} v{}", metadata.kind, metadata.version);
+}
+```
+
+### Rollback
+
+```bash
+# If something goes wrong after restart:
+drasi plugin rollback source-postgres
+# → restores archived v1.0.0 to active/, requires another restart
+
+drasi server restart
+```
+
+This is simpler than in-process rollback because the server is in a clean state — no partial migrations, no mixed-version components, no `retiring` maps.
+
+---
+
+## Open issues
+
+**Q1: Cross-instance coordination**
+A plugin is loaded server-wide. If the server has multiple DrasiLib instances, does the upgrade plan coordinate across all instances, or do operators upgrade per-instance?
+*Recommendation*: Server-wide (single UpgradePlan covers all instances).
+
+**Q2: Concurrent upgrades of different plugins**
+Can two different plugins be upgraded simultaneously?
+*Recommendation*: Yes — each UpgradePlan is independent. Only one upgrade per plugin at a time.
+
+**Q3: Automatic vs. manual triggering**
+Should the hot-reload watcher be able to trigger an automatic rolling upgrade when it detects a new binary?
+*Recommendation*: Not in v1. Add as opt-in later (`autoUpgrade: true` in config).
+
+**Q4: Plugin state migration**
+If plugin internal state format changes between versions, who migrates?
+*Recommendation*: The plugin itself, via an optional `migrate_state(old_version, state_store) -> Result<()>` hook in the plugin interface. If not implemented, state is wiped and the component re-bootstraps.
+
+**Q5: Timeout per component**
+How long should the system wait for a single component upgrade before declaring failure?
+*Recommendation*: Configurable with a default of 60 seconds (covers stop + initialize + start).
+
+**Q6: Plugin registry hosting**
+Where is the plugin registry hosted? Options: GitHub Releases (already used for Drasi releases), OCI registry (container-native), or a dedicated Drasi plugin registry service.
+
+**Q7: Staged binary validation**
+Should the server validate staged binaries on download (fail-fast) or only on startup promotion? Download-time validation gives earlier feedback but requires the server to be running.
