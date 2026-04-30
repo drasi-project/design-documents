@@ -314,6 +314,8 @@ pub struct FfiCompletedSpan {
 }
 ```
 
+**Ownership contract**: The plugin allocates all memory (`name`, `fields`). Pointers are valid only for the duration of the callback — the host must copy any data it needs before the callback returns. The plugin frees the memory after the callback returns. This is the same ownership model used by the existing `FfiLogEntry` callback.
+
 This means plugin spans appear as children of the pipeline trace. For example, a source plugin's `wal_parse` span becomes a child of `source.dispatch`, and a reaction plugin's `mqtt_publish` span becomes a child of `reaction.receive`:
 
 ```
@@ -341,7 +343,7 @@ Plugin developers use standard Rust `tracing` and `metrics` macros — no custom
 | **Metrics** (new) | `FfiMetricsRecorder` | `metrics::counter!()`, `metrics::histogram!()` | Intercepts recordings → `FfiMetricEntry` → `MetricsCallbackFn` |
 | **Traces** (new) | Extended `FfiTracingLayer` | `tracing::info_span!()` | Intercepts span open/close → `FfiCompletedSpan` → `SpanCallbackFn` |
 
-For trace context injection, the host sets `trace_id` + `parent_span_id` via task-local storage before each FFI call. The bridge layer reads it when a span is created and includes it in the `FfiCompletedSpan` sent back to the host. This is fully transparent to the plugin developer.
+For trace context injection, the host passes `trace_id` + `parent_span_id` explicitly via FFI function arguments (e.g., a `trace_context: FfiTraceContext` parameter on the vtable calls). Task-local storage cannot be used here because the plugin runs on its own tokio runtime, and task-locals do not cross runtime boundaries. The bridge layer in the plugin reads the trace context from the FFI argument when a span is created and includes it in the `FfiCompletedSpan` sent back to the host. This is fully transparent to the plugin developer.
 
 **Example: Source plugin** — standard `tracing` + `metrics` macros:
 
