@@ -156,6 +156,46 @@ Before considering a design document complete, verify:
 - [ ] Alternative approaches are documented
 - [ ] Open issues are clearly articulated
 
+## Post-Design Verification (POC)
+
+**After the design document is considered complete, propose verifying the design with a small proof-of-concept (POC) before implementation begins.** A POC closes the gap between "design looks reasonable on paper" and "the proposed mechanism actually works."
+
+### When to Propose a POC
+
+Always propose a POC for designs that involve:
+- New cross-component interactions (e.g., FFI boundaries, IPC, new SDK contracts)
+- New external dependencies or third-party libraries used in non-trivial ways
+- New runtime mechanisms (e.g., subscriber composition, custom recorders, span propagation)
+- Performance- or correctness-sensitive paths (e.g., shutdown ordering, backpressure, flush semantics)
+- Backward-compatibility claims that need to be demonstrated
+
+A POC may be skipped only when the design is purely additive configuration over already-proven code paths.
+
+### POC Workflow
+
+1. **Branch**: Create a new branch in the affected repository named `<design-name>-poc` (e.g., `tracing-metrics-poc`, `source-checkpoints-poc`). Never run POC work on `main` or on the design-document branch.
+2. **Location**: Place the POC in the most appropriate location:
+   - `examples/<crate>/<design-name>-poc/` for crate-level POCs
+   - A dedicated isolated workspace (`[workspace]` with no members other than itself) so it does not pull the parent project's full build graph when that would slow iteration
+3. **Scope**: Build the smallest possible self-contained program that exercises the design's core mechanism. It should:
+   - Be hermetic (no external services required to run; use in-memory stand-ins for collectors, brokers, databases, etc.)
+   - Be self-asserting (use `assert!` / `assert_eq!` so a successful run is unambiguous)
+   - Cover the design's verification table rows where practical
+   - Cover both the happy path AND important failure / edge cases (unreachable endpoint, missing config, shutdown flush, backward-compat default, etc.)
+4. **Iteration**: Implement the POC slice-by-slice. After each slice, run it and confirm assertions pass before adding the next.
+5. **Report back**: When the POC is working, summarize:
+   - Which design claims were verified
+   - Which design claims were intentionally NOT verified, and why
+   - Any surprises that should feed back into the design doc (new open issues, revised assumptions)
+
+### POC Quality Bar
+
+A good POC:
+- Compiles and runs cleanly with `cargo run` (or the language equivalent) — no manual setup steps
+- Prints a clear summary at the end: which scenarios ran, which assertions passed
+- Uses the same crate names, version constraints, and API shapes the real implementation will use, so the wiring transfers directly
+- Includes clear comments distinguishing "this is what the real system does" from "this is a stand-in for the POC"
+
 ## Common Patterns and Recommendations
 
 ### Architecture Diagrams
