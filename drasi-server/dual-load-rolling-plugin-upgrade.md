@@ -932,17 +932,6 @@ pub struct PluginRuntime<T: ?Sized> {
 | Field reorder | Use `ManuallyDrop` + explicit drop order in `Drop` impl; add `// SAFETY:` comments | Adds implementation complexity |
 | Grace period | After all Arc references drop, wait N seconds before allowing `dlclose` | Reduces (but doesn't eliminate) risk from straggler tasks |
 
-### Recommendation
-
-**Phase 1 (ship the upgrade feature):** Keep `mem::forget` — libraries are never unloaded. The upgrade workflow works identically; old libraries remain mapped in memory. The memory cost is negligible for typical deployment patterns (a few MB per plugin version, a few upgrades per deployment cycle).
-
-**Phase 2 (optional, future):** Introduce Arc-based unloading only after:
-1. A formal **plugin shutdown protocol** exists — plugins must implement a `shutdown() -> impl Future` that joins all spawned tasks and returns only when no plugin code is executing.
-2. The host-sdk enforces that **no trait objects escape** the runtime boundary without carrying their own `Arc<Library>` clone.
-3. Integration tests with ASAN/MSAN validate that `dlclose` is safe under concurrent load.
-
-The memory saved by unloading is marginal (~5-10 MB per old plugin version). The segfault risk surface is large and hard to audit, especially since plugin authors link arbitrary third-party crates. The conservative approach is to defer unloading until the shutdown protocol is proven.
-
 ---
 
 ## Argument Against Hot Upgrades
@@ -984,29 +973,3 @@ Even with the `mem::forget` mitigation (never unload), the hot upgrade path stil
 ### Conclusion
 
 Hot plugin upgrades are a **nice-to-have** feature that introduces **must-not-have** risk characteristics. The operational benefit (avoiding a few seconds of source interruption) does not justify the complexity, testing burden, and failure-mode surface area. Drasi's existing architecture — cursor-based resumption and query resilience to source gaps — already provides the availability guarantees that hot upgrades aim to deliver.
-
-**Recommendation:** Ship a polished `drasi plugin upgrade --restart` command that performs a coordinated restart-based upgrade with proper validation, backup, and status reporting. Defer hot upgrades to a future version only if customer demand demonstrates that the seconds of downtime during restart are genuinely unacceptable in practice.
-
----
-
-## Open issues
-
-**Q1: Cross-instance coordination**
-A plugin is loaded server-wide. If the server has multiple DrasiLib instances, does the upgrade plan coordinate across all instances, or do operators upgrade per-instance?
-*Recommendation*: Server-wide (single UpgradePlan covers all instances).
-
-**Q2: Concurrent upgrades of different plugins**
-Can two different plugins be upgraded simultaneously?
-*Recommendation*: Yes — each UpgradePlan is independent. Only one upgrade per plugin at a time.
-
-**Q3: Automatic vs. manual triggering**
-Should the hot-reload watcher be able to trigger an automatic rolling upgrade when it detects a new binary?
-*Recommendation*: Not in v1. Add as opt-in later (`autoUpgrade: true` in config).
-
-**Q4: Plugin state migration**
-If plugin internal state format changes between versions, who migrates?
-*Recommendation*: The plugin itself, via an optional `migrate_state(old_version, state_store) -> Result<()>` hook in the plugin interface. If not implemented, state is wiped and the component re-bootstraps.
-
-**Q5: Timeout per component**
-How long should the system wait for a single component upgrade before declaring failure?
-*Recommendation*: Configurable with a default of 60 seconds (covers stop + initialize + start).
