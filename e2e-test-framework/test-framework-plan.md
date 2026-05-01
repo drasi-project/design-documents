@@ -349,7 +349,21 @@ Each target supports a different set of query index backends. The test suite mus
 
 ### Failure Recovery
 
-_To be defined collaboratively in a later iteration._
+The following scenarios are feasible with the current ETF capabilities or with modest extensions:
+
+- **Source pause and resume.** The ETF already supports `pause`/`start` control on sources via its REST API. A test can dispatch N events, pause the source, verify partial results, resume, and verify the final result matches the full run. This validates that no events are lost during a pause/resume cycle.
+
+- **Query stop and restart.** The ETF supports `stop`/`start` on query observers. For embedded mode, the Drasi engine can also stop and restart a query. A test can process events, stop the query, continue dispatching changes (which the query misses), restart the query (triggering re-bootstrap), and verify the query reaches the correct final state.
+
+- **Server process restart (drasi-server).** In standalone mode, the run script can kill and restart the drasi-server binary between test phases. With `persistIndex: false`, the server must re-bootstrap from the source and produce the same results. With `persistIndex: true`, the server should recover from the persisted RocksDB index without re-bootstrapping. This requires the run script to orchestrate pause → kill → restart → resume, which is scriptable but not yet automated in the ETF.
+
+- **Server process restart with state store (drasi-server).** When a source is configured with a `stateStore` (e.g., `kind: redb`), restarting the server should cause the source to resume from where it left off rather than replaying from the beginning. The ETF can verify this by checking that no duplicate reaction outputs are produced after restart.
+
+- **Reaction stop and restart.** Stop a reaction observer while the query continues producing results, then restart it. The reaction should catch up on any results it missed during the gap. The ETF's reaction control APIs (`stop`/`start`) already support this.
+
+The following scenarios require more significant work or depend on features not yet implemented:
+
+- **Checkpoint-based source replay.** The Source Checkpoints design (documented in `drasi-lib/Source-Checkpoints/`) is not yet fully implemented. Once available, tests can verify that a source restarts from its last checkpoint rather than replaying all events.
 
 ### Tracing and Metrics Integration
 
