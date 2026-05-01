@@ -15,8 +15,6 @@ Each example provides both `run_debug.sh` and `run_release.sh` scripts. For CI, 
 
 **Automatable in CI workflows.** The test suite must run automatically in GitHub Actions. Trigger conditions are TBD — candidates include on every PR, on pushes to `main`/`feature-lib`, or via `workflow_dispatch` for manual CI runs.
 
-**Replicable with consistent, expected, and verifiable results.** Test data generators must use fixed seeds for reproducibility. Outputs must be compared against golden files or inline assertions so that every run produces the same pass/fail result. To support this across all three Drasi variants (drasi-platform, drasi-lib, drasi-server), the ETF test config needs updates to its YAML format — specifically around how a test definition selects its target and dispatches changes to it.
-
 #### Current Config Structure
 
 Today, each test target has its own completely separate config file with the test logic (data model, queries, etc.) duplicated inside it. The examples below are from the existing building comfort E2E test on the `feature-lib` branch.
@@ -301,6 +299,17 @@ cargo run --release -p drasi-server -- --config "$SCRIPT_DIR/server-config-rocks
 **For drasi-platform mode**, the same principle applies — the ETF deployment config stays the same, and you swap the QueryContainer resource definition to change the storage profile (memory, Redis, RocksDB). This is already how the `drasi_platform/` subdirectories work today (`query_container_default/`, `query_container_memory/`, `query_container_redis/`, `query_container_rocks/`).
 
 **ETF change required:** Add support for `config_file:` as an alternative to inline `config:` in the `drasi_servers` block. When `config_file` is present, the ETF loads the Drasi engine config from the referenced file path (relative to the ETF config file) instead of expecting it inline. This is a small, targeted change — the loaded content has the exact same schema as the existing inline `config:` block.
+
+---
+
+## How Each Target Is Consumed
+
+**drasi-lib (Embedded Mode).** The ETF consumes drasi-lib via the `drasi-core` git submodule in the `test-infra` repo. The `test-run-host` crate depends on it as a Cargo path dependency, so drasi-lib is compiled directly into the test-service binary. Tests use `DrasiServerChannel` dispatchers for zero-network in-process communication. To test a different version, update the submodule pointer. This mode already works today on the `feature-lib` branch.
+
+**drasi-server (Standalone Mode).** The run script downloads a pre-built drasi-server binary from GitHub Releases or the published Docker image, starts it with a `server-config.yaml`, and then runs the ETF test-service separately. The ETF dispatches changes to the server via HTTP or gRPC. For local development, a `--binary` flag can override with a locally-built binary. To test different index backends, swap the server config file.
+
+**drasi-platform (Kubernetes Mode).** The test-service is deployed as a pod alongside Drasi Platform on a Kind/K3D cluster. Communication happens via Dapr or Redis streams. Tests are controlled via the ETF's REST API. To test different index backends, swap the QueryContainer resource definition.
+
 
 
 **Public.** All test configuration and test data must be publicly accessible without authentication tokens. The ETF's `GitHub` test repo backend fetches files via the GitHub REST API at runtime, which is subject to rate limiting (60 requests/hour unauthenticated, 5,000 with a PAT). This makes it unsuitable for hosting test data that gets pulled repeatedly across test runs and CI jobs. The options are:
