@@ -490,3 +490,11 @@ The migration involves:
 2. Adding `bootstrapProvider: { kind: scriptfile, filePaths: [...] }` to the Drasi engine config files (`drasi-memory.yaml`, `server-config.yaml`, etc.)
 3. Removing the `bootstrap_data_generator` block from the ETF's source config for these tests
 4. Hosting the JSONL bootstrap files locally in the repo (for drasi-lib/server) or on Hugging Face Hub (for larger datasets)
+
+### Using Drasi's Mock Source vs ETF Data Generators
+
+Drasi Server and drasi-lib include a built-in Mock source (`kind: mock`) that generates synthetic data internally — `Counter`, `SensorReading`, and `Generic` types. For simple test scenarios that only need single-node data (projections, filters, property updates), the Mock source could replace the ETF's model data generator entirely. This would remove the ETF from the data path, making the test exercise Drasi's own data generation → query → reaction pipeline with nothing in between.
+
+However, the Mock source currently only generates flat node data with no relationships or hierarchical structure. It cannot produce the `Building → Floor → Room` graph with `PART_OF` relationships that is needed for join queries, multi-hop traversals, or aggregations across a hierarchy. For these tests, the ETF's `BuildingHierarchy` model generator (or script-based sources) remains necessary.
+
+If the team wants to reduce dependency on the ETF for data generation, one option would be to extend the Mock source to support relationship generation and hierarchical structures. This is a discussion point for the team — the trade-off is implementation effort in drasi-server/drasi-lib vs the testing simplicity gained by keeping data generation inside the Drasi engine.
