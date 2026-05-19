@@ -5,31 +5,40 @@
 ## Test Framework Requirements
 
 
-**Runnable manually.** Developers must be able to run the full test suite from their local machine. The existing building_comfort examples on the `feature-lib` branch demonstrate three distinct run patterns depending on the target:
+**Runnable manually.** Developers must be able to run the full test suite from their local machine or as a Github Actions workflow (triggered via `workflow_dispatch`). The existing building_comfort examples in the [test-infra](https://github.com/drasi-project/test-infra) repo demonstrate three distinct run patterns:
 
-- **Embedded (drasi-lib in-process):** A single shell script runs the test-service with an embedded Drasi engine — no external processes needed. The script invokes `cargo run --release --manifest-path ./test-service/Cargo.toml -- --config <config.json>` from the `e2e-test-framework` directory. Everything runs in one process.
-- **Drasi Server (standalone):** A shell script first builds and starts the drasi-server binary (from a sibling `../../drasi-server` directory) with a `server-config.yaml`, waits for its health check, and then starts the test-service with a separate `config.json` that dispatches changes via HTTP or gRPC to the running server. Two processes run side by side; a `stop.sh` script cleans up both.
+- **drasi-lib (in-process):** A single shell script runs the test-service with drasi-lib compiled in — no external processes needed. The script invokes `cargo run --release --manifest-path ./test-service/Cargo.toml -- --config <config.json>` from the `e2e-test-framework` directory. Everything runs in one process.
+- **Drasi Server (standalone):** A shell script first builds and starts the drasi-server binary (from a sibling `../../drasi-server` directory) with a `server-config.yaml`, waits for its health check, and then starts the test-service with a separate `config.json` that dispatches changes via HTTP or gRPC to the running server. Currently it can use either a prebuilt binary or execute `cargo run` from a `drasi-server` repo. It is also worthing noting that we have four variants of the drasi-server pattern: http, http adaptive, grpc and grpc adaptive.
 - **Drasi Platform (Kubernetes):** The test-service is deployed as a Kubernetes pod alongside Drasi Platform. Tests are controlled via REST API calls (using `curl` or `.http` files) to the test-service's API endpoint, which is port-forwarded from the cluster. The drasi_platform example has sub-variants for different query container index backends (`query_container_default`, `query_container_memory`, `query_container_redis`, `query_container_rocks`).
 
 Each example provides both `run_debug.sh` and `run_release.sh` scripts. For CI, the same scripts (or equivalent `workflow_dispatch` triggers) can be used in GitHub Actions.
 
-**Automatable in CI workflows.** The test suite must run automatically in GitHub Actions. Trigger conditions are TBD — candidates include on every PR, on pushes to `main`/`feature-lib`, or via `workflow_dispatch` for manual CI runs.
+**Automatable in CI workflows.** The test framework should be executed in automated tests. There are multiple ways to approach this:
+
+- **Triggered via `workflow_dispatch`.** A manually triggered workflow that lets the user select which target mode and variant to run. This is useful for on-demand testing — for example, running the full suite against a specific drasi-server release before cutting a new version, or validating a particular index backend after a related code change.
+
+- **Triggered on pull requests or pushes to `main`.** Running tests automatically on PRs. The trade-off is increased build time. Compiling the test-service (especially for drasi-lib mode, which compiles all of drasi-lib into the binary) and running 100K+ event tests adds significant minutes to each PR check. A practical compromise is to run a smaller, faster subset (e.g., 1K events with memory index) on every PR and reserve the full suite for `workflow_dispatch` or merges to `main`.
+
+- **Scheduled runs (cron).** A nightly or weekly schedule can run the full test suite against the latest `main` of drasi-core, drasi-server and drasi-platform.
+
 
 #### Current Config Structure
 
-Today, each test target has its own completely separate config file with the test logic (data model, queries, etc.) duplicated inside it. The examples below are from the existing building comfort E2E test on the `feature-lib` branch.
-
-**Embedded config** (`drasi_embedded/config.yaml`) — everything in one file, one process:
+Today, each test target has its own completely separate config file with the test logic (data model, queries, etc.) duplicated inside it. 
+<!-- 
+The examples below are from the existing building comfort E2E test in the test-infra repo. -->
+<!-- 
+**Embedded config** (`drasi_lib/config.yaml`) — everything in one file, one process:
 
 ```yaml
 data_store:
-  data_store_path: examples/building_comfort/drasi_embedded/test_data_cache
+  data_store_path: examples/building_comfort/drasi_lib/test_data_cache
   delete_on_start: true
   delete_on_stop: true
   test_repos:
     - id: local_dev_repo
       kind: LocalStorage
-      source_path: examples/building_comfort/drasi_embedded/dev_repo
+      source_path: examples/building_comfort/drasi_lib/dev_repo
       local_tests:
         - test_id: building_comfort
           test_folder: building_comfort
@@ -99,7 +108,7 @@ test_run_host:
             - kind: PerformanceMetrics
 ```
 
-**Drasi Server config** (`drasi_server/drasi_server_grpc/`) — two separate files, two processes:
+**Drasi Server config** (`drasi_server_grpc/`) — two separate files, two processes:
 
 The Drasi Server itself gets `server-config.yaml`:
 ```yaml
@@ -157,158 +166,191 @@ The ETF gets `config.json` with gRPC dispatchers/handlers:
     "stop_triggers": [{ "kind": "RecordCount", "record_count": 100000 }]
   }]
 }
-```
-
-#### Issue with existing solution
+``` -->
 
 The core test logic — the BuildingHierarchy model config (seed, change_count, sensor definitions), the query text, and the stop trigger count — is duplicated across every target variant. Adding a new test scenario or modifying an existing one requires updating 3-4 files. The `source_change_dispatchers`, `output_handler`, and `drasi_servers` blocks are the only parts that differ between targets.
 
 #### Proposed Changes
 
-The goal is to make it easy to run the same test against different versions and configurations of Drasi. Within a target mode (embedded, standalone server, platform), the ETF config — model generator, dispatchers, handlers, stop triggers — stays fixed. What changes between variants is only the Drasi engine configuration (storage backend, persistence settings, etc.). So the approach is to keep the ETF config as a self-contained file per target mode, and make the Drasi engine config a separate, swappable file.
+The goal is to have a single central test config per test scenario that works with any Drasi target. The test config defines the "what" (test ID, data model, queries, stop criteria), and a separate pattern file defines the "how" (dispatchers, handlers, engine/server config, runtime settings). The ETF merges them at load time.
 
-Each test has one ETF config per target mode and multiple Drasi config files — one per variant:
+Each test scenario has one central config and multiple pattern files:
 
 ```
 building_comfort/
-├── embedded/
-│   ├── config.yaml                  # ETF config (fixed for embedded mode)
-│   ├── drasi-memory.yaml            # Drasi engine: storage.type = memory
-│   └── drasi-rocksdb.yaml           # Drasi engine: storage.type = file (RocksDB)
-├── server-grpc/
-│   ├── config.yaml                  # ETF config (fixed for gRPC mode)
-│   ├── server-config-memory.yaml    # Drasi server: persistIndex = false
-│   └── server-config-rocksdb.yaml   # Drasi server: persistIndex = true
-├── server-http/
-│   ├── config.yaml                  # ETF config (fixed for HTTP mode)
-│   ├── server-config-memory.yaml
-│   └── server-config-rocksdb.yaml
-└── data/expected/                   # Golden files for result verification
+├── test-config.yaml                   # Central: test ID, data model, queries, stop triggers
+├── patterns/
+│   ├── drasi-lib-memory.yaml          # drasi-lib with memory index
+│   ├── drasi-lib-rocksdb.yaml         # drasi-lib with RocksDB index
+│   ├── server-grpc-memory.yaml        # drasi-server via gRPC, memory index
+│   ├── server-grpc-rocksdb.yaml       # drasi-server via gRPC, persistent index
+│   ├── server-http-memory.yaml        # drasi-server via HTTP, memory index
+│   ├── platform-memory.yaml           # drasi-platform, memory query container
+│   ├── platform-redis.yaml            # drasi-platform, Redis query container
+│   └── platform-rocksdb.yaml          # drasi-platform, RocksDB query container
 ```
 
-**For embedded mode**, the ETF config references the Drasi engine config by file path instead of inlining it. To test a different storage backend, you just swap the filename:
-
-```yaml
-# config.yaml (embedded mode — ETF config)
-data_store:
-  data_store_path: test_data_cache
-  delete_on_start: true
-  delete_on_stop: true
-  test_repos:
-    - id: local_dev_repo
-      kind: LocalStorage
-      source_path: dev_repo
-      local_tests:
-        - test_id: building_comfort
-          test_folder: building_comfort
-          drasi_servers:
-            - id: embedded-drasi-server
-              config_file: drasi-memory.yaml    # <-- swap this to change variant
-          sources:
-            - test_source_id: facilities-db
-              kind: Model
-              source_change_dispatchers:
-                - kind: DrasiServerChannel
-                  drasi_server_id: embedded-drasi-server
-                  source_id: facilities-db
-                  buffer_size: 2048
-              model_data_generator:
-                kind: BuildingHierarchy
-                seed: 123456789
-                change_count: 100000
-                # ... full sensor configs ...
-          reactions:
-            - test_reaction_id: building-comfort
-              output_handler:
-                kind: DrasiServerChannel
-                drasi_server_id: embedded-drasi-server
-                reaction_id: building-comfort-alerts
-              stop_triggers:
-                - kind: RecordCount
-                  record_count: 90000
-
-test_run_host:
-  test_runs:
-    - test_id: building_comfort
-      test_repo_id: local_dev_repo
-      test_run_id: test_run_001
-      drasi_servers:
-        - test_drasi_server_id: embedded-drasi-server
-          start_immediately: true
-      sources:
-        - test_source_id: facilities-db
-          start_mode: auto
-      reactions:
-        - test_reaction_id: building-comfort
-          start_immediately: true
-          output_loggers:
-            - kind: PerformanceMetrics
-```
-
-The swappable Drasi config files contain only the engine definition:
-
-```yaml
-# drasi-memory.yaml
-storage:
-  type: memory
-sources:
-  - id: facilities-db
-    source_type: application
-    auto_start: true
-queries:
-  - id: all-rooms
-    query: "MATCH (r:Room) RETURN elementId(r) AS RoomId, r.temperature, r.humidity, r.co2"
-    sources: [facilities-db]
-    auto_start: true
-reactions:
-  - id: building-comfort-alerts
-    reaction_type: application
-    queries: [all-rooms]
-    auto_start: true
-```
-
-```yaml
-# drasi-rocksdb.yaml — only storage differs
-storage:
-  type: file
-  path: /tmp/drasi-test-index
-  persist: true
-sources:
-  - id: facilities-db
-    source_type: application
-    auto_start: true
-queries:
-  - id: all-rooms
-    query: "MATCH (r:Room) RETURN elementId(r) AS RoomId, r.temperature, r.humidity, r.co2"
-    sources: [facilities-db]
-    auto_start: true
-reactions:
-  - id: building-comfort-alerts
-    reaction_type: application
-    queries: [all-rooms]
-    auto_start: true
-```
-
-**For standalone drasi-server mode**, nothing changes in the ETF config. The run script just passes a different `server-config.yaml` to the `drasi-server` binary:
+To run a test, you pass both files:
 
 ```bash
-# run_release.sh — swap the server config to change variant
-cargo run --release -p drasi-server -- --config "$SCRIPT_DIR/server-config-rocksdb.yaml"
+cargo run -p test-service -- --test-config test-config.yaml --pattern patterns/drasi-lib-memory.yaml
 ```
 
-**For drasi-platform mode**, the same principle applies — the ETF deployment config stays the same, and you swap the QueryContainer resource definition to change the storage profile (memory, Redis, RocksDB). This is already how the `drasi_platform/` subdirectories work today (`query_container_default/`, `query_container_memory/`, `query_container_redis/`, `query_container_rocks/`).
+The **test config** (`test-config.yaml`) contains only the target-agnostic parts — the data model generator, query definitions, reaction observers, and stop triggers. Dispatchers and handlers are left empty for the pattern file to fill in:
 
-**ETF change required:** Add support for `config_file:` as an alternative to inline `config:` in the `drasi_servers` block. When `config_file` is present, the ETF loads the Drasi engine config from the referenced file path (relative to the ETF config file) instead of expecting it inline. This is a small, targeted change — the loaded content has the exact same schema as the existing inline `config:` block.
+```yaml
+# test-config.yaml — central test definition, same for all targets
+test_id: building_comfort
+version: 1
+description: Building comfort monitoring with room temperature, humidity, and CO2
+
+sources:
+  - test_source_id: facilities-db
+    kind: Model
+    source_change_dispatchers: []       # filled in by pattern file
+    model_data_generator:
+      kind: BuildingHierarchy
+      seed: 123456789
+      change_count: 100000
+      spacing_mode: none
+      time_mode: "2025-01-03T10:03:15.4Z"
+      building_count: [1, 0]
+      floor_count: [1, 0]
+      room_count: [1, 0]
+      room_sensors:
+        - kind: NormalFloat
+          id: temperature
+          momentum_init: [5, 1, 0.5]
+          value_change: [1, 0]
+          value_init: [5000, 0]
+          value_range: [0, 10000]
+        # ... co2, humidity sensors ...
+
+reactions:
+  - test_reaction_id: building-comfort
+    output_handler: {}                  # filled in by pattern file
+    stop_triggers:
+      - kind: RecordCount
+        record_count: 90000
+```
+
+A **pattern file** for drasi-lib (`patterns/drasi-lib-memory.yaml`) supplies the dispatchers, handlers, engine config, and runtime settings:
+
+```yaml
+# patterns/drasi-lib-memory.yaml
+drasi_servers:
+  - id: drasi-lib-instance
+    config:
+      storage:
+        type: memory
+      sources:
+        - id: facilities-db
+          source_type: application
+          auto_start: true
+      queries:
+        - id: all-rooms
+          query: "MATCH (r:Room) RETURN elementId(r) AS RoomId, r.temperature, r.humidity, r.co2"
+          sources: [facilities-db]
+          auto_start: true
+      reactions:
+        - id: building-comfort-alerts
+          reaction_type: application
+          queries: [all-rooms]
+          auto_start: true
+
+source_dispatchers:
+  facilities-db:
+    kind: DrasiServerChannel
+    drasi_server_id: drasi-lib-instance
+    source_id: facilities-db
+    buffer_size: 2048
+
+reaction_handlers:
+  building-comfort:
+    kind: DrasiServerChannel
+    drasi_server_id: drasi-lib-instance
+    reaction_id: building-comfort-alerts
+    buffer_size: 1024
+
+run:
+  drasi_servers:
+    - test_drasi_server_id: drasi-lib-instance
+      start_immediately: true
+  sources:
+    - test_source_id: facilities-db
+      start_mode: auto
+  reactions:
+    - test_reaction_id: building-comfort
+      start_immediately: true
+      output_loggers:
+        - kind: PerformanceMetrics
+```
+
+A **pattern file** for drasi-server (`patterns/server-grpc-memory.yaml`) uses gRPC dispatchers with no embedded engine:
+
+```yaml
+# patterns/server-grpc-memory.yaml
+source_dispatchers:
+  facilities-db:
+    kind: Grpc
+    host: localhost
+    port: 50051
+    source_id: facilities-db
+    timeout_seconds: 60
+
+reaction_handlers:
+  building-comfort:
+    kind: Grpc
+    host: 0.0.0.0
+    port: 50052
+    query_ids: [building-comfort]
+    correlation_metadata_key: x-query-sequence
+
+drasi_server_config: server-config-memory.yaml
+
+run:
+  sources:
+    - test_source_id: facilities-db
+      start_mode: auto
+  reactions:
+    - test_reaction_id: building-comfort
+      start_immediately: true
+      output_loggers:
+        - kind: JsonlFile
+        - kind: PerformanceMetrics
+```
+
+**How the merge works.** When the ETF loads both files, it:
+
+1. Takes the test config as the base (sources, reactions, stop triggers, data model)
+2. Injects `source_dispatchers` from the pattern file into each source by matching on `test_source_id`
+3. Injects `reaction_handlers` from the pattern file into each reaction by matching on `test_reaction_id`
+4. Injects the `drasi_servers` block (if present) into the test definition
+5. Uses the `run` section from the pattern file as the `test_run_host` config
+6. Wraps both in the `data_store` / `test_repos` boilerplate automatically
+
+**What this enables:**
+
+- Adding a new test scenario means writing one `test-config.yaml` — no per-target duplication
+- Adding a new target pattern means writing one pattern file — no test logic duplication
+- Changing a test's data model or query updates one file that all patterns share
+- The pattern files are small and focused (dispatchers + engine config only)
+
+**ETF changes required:**
+
+- New CLI arguments: `--test-config <path>` and `--pattern <path>` (alongside the existing `--config` for backward compatibility)
+- A config merge function that combines the two files as described above
+- The existing `--config` flag continues to work for self-contained configs (no breaking change)
 
 ---
 
 ## How Each Target Is Consumed
 
-**drasi-lib (Embedded Mode).** The ETF consumes drasi-lib via the `drasi-core` git submodule in the `test-infra` repo. The `test-run-host` crate depends on it as a Cargo path dependency, so drasi-lib is compiled directly into the test-service binary. Tests use `DrasiServerChannel` dispatchers for zero-network in-process communication. To test a different version, update the submodule pointer. This mode already works today on the `feature-lib` branch.
+**drasi-lib.** The ETF consumes drasi-lib via the `drasi-core` git submodule in the `test-infra` repo. The `test-run-host` crate depends on it as a Cargo path dependency, so drasi-lib is compiled directly into the test-service binary. Tests use `DrasiServerChannel` dispatchers for zero-network in-process communication. To test a different version, update the submodule pointer.
 
-**drasi-server (Standalone Mode).** The run script downloads a pre-built drasi-server binary from GitHub Releases or the published Docker image, starts it with a `server-config.yaml`, and then runs the ETF test-service separately. The ETF dispatches changes to the server via HTTP or gRPC. For local development, a `--binary` flag can override with a locally-built binary. To test different index backends, swap the server config file.
+**drasi-server.** The run script downloads a pre-built drasi-server binary from GitHub Releases or the published Docker image, starts it with a `server-config.yaml` (referenced by the pattern file's `drasi_server_config` field), and then runs the ETF test-service separately. The ETF dispatches changes to the server via HTTP or gRPC as specified in the pattern file. For local development, a `--binary` flag can override with a locally-built binary.
 
-**drasi-platform (Kubernetes Mode).** The test-service is deployed as a pod alongside Drasi Platform on a Kind/K3D cluster. Communication happens via Dapr or Redis streams. Tests are controlled via the ETF's REST API. To test different index backends, swap the QueryContainer resource definition.
+**drasi-platform.** The test-service is deployed as a pod alongside Drasi Platform on a Kind/K3D cluster. Communication happens via Dapr or Redis streams as specified in the pattern file. Tests are controlled via the ETF's REST API.
 
 
 
@@ -353,7 +395,7 @@ The following scenarios are feasible with the current ETF capabilities or with m
 
 - **Source pause and resume.** The ETF already supports `pause`/`start` control on sources via its REST API. A test can dispatch N events, pause the source, verify partial results, resume, and verify the final result matches the full run. This validates that no events are lost during a pause/resume cycle.
 
-- **Query stop and restart.** The ETF supports `stop`/`start` on query observers. For embedded mode, the Drasi engine can also stop and restart a query. A test can process events, stop the query, continue dispatching changes (which the query misses), restart the query (triggering re-bootstrap), and verify the query reaches the correct final state.
+- **Query stop and restart.** The ETF supports `stop`/`start` on query observers. For drasi-lib mode, the Drasi engine can also stop and restart a query. A test can process events, stop the query, continue dispatching changes (which the query misses), restart the query (triggering re-bootstrap), and verify the query reaches the correct final state.
 
 - **Server process restart (drasi-server).** In standalone mode, the run script can kill and restart the drasi-server binary between test phases. With `persistIndex: false`, the server must re-bootstrap from the source and produce the same results. With `persistIndex: true`, the server should recover from the persisted RocksDB index without re-bootstrapping. This requires the run script to orchestrate pause → kill → restart → resume, which is scriptable but not yet automated in the ETF.
 
@@ -463,7 +505,7 @@ Today, when a test uses recorded data (as opposed to model-generated data), the 
 Drasi Server and drasi-lib now support a native `scriptfile` bootstrap provider — a Drasi plugin that loads initial data from JSONL files directly during query startup, before streaming begins:
 
 ```yaml
-# Drasi server-config.yaml or embedded drasi config
+# Drasi server-config.yaml or drasi-lib config
 sources:
   - id: facilities-db
     source_type: application
