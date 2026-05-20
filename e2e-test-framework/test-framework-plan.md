@@ -8,7 +8,9 @@
 
 - **drasi-lib (in-process).**
   - *Today:* A single shell script runs the test-service with drasi-lib compiled in — no external processes needed. The script invokes `cargo run --release --manifest-path ./test-service/Cargo.toml -- --config <config.json>` from the `e2e-test-framework` directory. Everything runs in one process.
-  - *Proposed:* The ETF continues to consume drasi-lib via the `drasi-core` git submodule in the `test-infra` repo. The `test-run-host` crate depends on it as a Cargo path dependency, so drasi-lib is compiled directly into the test-service binary. To test a different version, update the submodule pointer.
+  - *Proposed:* drasi-lib is consumed in one of two ways depending on the trigger:
+    - **Release validation and scheduled runs.** The `test-run-host` crate depends on the published `drasi-lib` crate from crates.io (pinned to a released version). This exercises the same artifact users consume.
+    - **`pull_request` runs.** The ETF consumes drasi-lib via the `drasi-core` git submodule in the `test-infra` repo, with `test-run-host` taking it as a Cargo path dependency. This lets PRs against drasi-core validate changes before any release exists — bump the submodule pointer to test a different revision.
 
 - **Drasi Server (standalone).**
   - *Today:* A shell script first builds and starts the drasi-server binary (from a sibling `../../drasi-server` directory) with a `server-config.yaml`, waits for its health check, and then starts the test-service with a separate `config.json` that dispatches changes via HTTP or gRPC to the running server. It can use either a prebuilt binary or execute `cargo run` from a `drasi-server` repo. There are four variants of this pattern: http, http adaptive, grpc, and grpc adaptive.
@@ -157,7 +159,7 @@ The test suite should exercise a variety of source, query, and reaction configur
 
 ### Query Indexes
 
-Each target supports a different set of query index backends. The test suite must cover all supported configurations per target:
+Each target supports a different set of query index backends.
 
 | Target | Available Index Backends |
 |--------|------------------------|
