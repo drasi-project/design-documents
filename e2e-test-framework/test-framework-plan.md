@@ -9,14 +9,14 @@
 - **drasi-lib (in-process).**
   - *Today:* A single shell script runs the test-service with drasi-lib compiled in — no external processes needed. The script invokes `cargo run --release --manifest-path ./test-service/Cargo.toml -- --config <config.json>` from the `e2e-test-framework` directory. Everything runs in one process.
   - *Proposed:* drasi-lib is consumed in one of two ways depending on the trigger:
-    - **Release validation and scheduled runs.** The `test-run-host` crate depends on the published `drasi-lib` crate from crates.io (pinned to a released version). This exercises the same artifact users consume.
-    - **`pull_request` runs.** The ETF consumes drasi-lib via the `drasi-core` git submodule in the `test-infra` repo, with `test-run-host` taking it as a Cargo path dependency. This lets PRs against drasi-core validate changes before any release exists — bump the submodule pointer to test a different revision.
+    - **Release runs.** The `test-run-host` crate depends on the published `drasi-lib` crate from crates.io (pinned to a released version). This exercises the same artifact users consume.
+    - **Source runs.** The ETF consumes drasi-lib via the `drasi-core` git submodule in the `test-infra` repo, with `test-run-host` taking it as a Cargo path dependency. This lets PRs against drasi-core validate changes before any release exists — bump the submodule pointer to test a different revision.
 
 - **Drasi Server (standalone).**
   - *Today:* A shell script first builds and starts the drasi-server binary (from a sibling `../../drasi-server` directory) with a `server-config.yaml`, waits for its health check, and then starts the test-service with a separate `config.json` that dispatches changes via HTTP or gRPC to the running server. It can use either a prebuilt binary or execute `cargo run` from a `drasi-server` repo. There are four variants of this pattern: http, http adaptive, grpc, and grpc adaptive.
   - *Proposed:* The drasi-server binary is obtained in one of two ways depending on the trigger:
-    - **Release validation and scheduled runs.** The run script pulls a pre-built drasi-server binary from GitHub Releases (or the published Docker image). This exercises the same artifact users consume.
-    - **`pull_request` runs.** The run script builds drasi-server from source with `cargo run` against a checked-out `drasi-server` repo (typically a sibling working copy or a checkout pinned by the workflow). This lets PRs against drasi-server validate changes before any release exists.
+    - **Release runs.** The run script pulls a pre-built drasi-server binary from GitHub Releases (or the published Docker image). This exercises the same artifact users consume.
+    - **Source runs.** The run script builds drasi-server from source with `cargo run` against a checked-out `drasi-server` repo (typically a sibling working copy or a checkout pinned by the workflow). This lets PRs against drasi-server validate changes before any release exists.
 
     In both cases the server config is supplied by the consolidated `config.json` (see "Proposed Changes" below) rather than a separate `server-config.yaml`, and the ETF takes over the start/health-check/stop lifecycle for the server process.
 
