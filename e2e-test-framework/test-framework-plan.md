@@ -30,176 +30,91 @@ The core test logic — the BuildingHierarchy model config (seed, change_count, 
 
 #### Proposed Changes
 
-The goal is to have a single central test config per test scenario that works with any Drasi target. The test config defines the "what" (test ID, data model, queries, stop criteria), and a separate pattern file defines the "how" (dispatchers, handlers, engine/server config, runtime settings). The ETF merges them at load time.
+**Collapse the drasi-server YAML into `config.json`.** Looking at the four `drasi_server_*` variants in [`examples/building_comfort`](https://github.com/drasi-project/test-infra/tree/main/e2e-test-framework/examples/building_comfort), the per-variant `drasi_server_config.yaml` files are nearly identical. `apiVersion`, `host`/`port`, `logLevel`, `autoInstallPlugins`/`verifyPlugins`, and `persistConfig` are the same across all of them, and the only meaningful differences are the transport-specific blocks (`plugins`, the `sources[*].kind`/port, and the `reactions[*].kind`/endpoint). Those transport choices are already encoded in `config.json` via `source_change_dispatchers` (e.g., `Http` on port 9000, `Grpc` on port 50051) and the reaction `output_handler`, so the YAML is duplicating information the ETF already owns.
 
-Each test scenario has one central config and multiple pattern files:
+The `drasi_lib` example shows the consolidated pattern we want to land on: the entire engine config (sources, queries, reactions, plus instance-level settings) is embedded inline under a `drasi_lib_instances` block in `config.json`, with no companion YAML required. We can apply the same pattern to drasi-server by introducing a `drasi_server_instances` block in `config.json` that carries the full server config. At run time the ETF either (a) serializes that block to a temporary YAML and passes it to the drasi-server process via `--config`, or (b) extends drasi-server to accept JSON config directly (its config schema is already structurally identical).
 
-```
-building_comfort/
-├── test-config.yaml                   # Central: test ID, data model, stop triggers
-├── patterns/
-│   ├── drasi-lib-memory.yaml          # drasi-lib with memory index
-│   ├── drasi-lib-rocksdb.yaml         # drasi-lib with RocksDB index
-│   ├── server-grpc-memory.yaml        # drasi-server via gRPC, memory index
-│   ├── server-grpc-rocksdb.yaml       # drasi-server via gRPC, persistent index
-│   ├── server-http-memory.yaml        # drasi-server via HTTP, memory index
-│   ├── platform-memory.yaml           # drasi-platform, memory query container
-│   ├── platform-redis.yaml            # drasi-platform, Redis query container
-│   └── platform-rocksdb.yaml          # drasi-platform, RocksDB query container
-```
+An example of what the consolidated `config.json` could look like for the `drasi_server_http` variant:
 
-To run a test, you pass both files:
+```json
+{
+  "data_store": {
+    "test_repos": [{
+      "id": "drasi_server_dev_repo",
+      "kind": "LocalStorage",
+      "source_path": "./dev_repo",
+      "local_tests": [{
+        "test_id": "building_comfort",
+        "test_folder": "building_comfort",
+        "sources": [{
+          "test_source_id": "facilities-db",
+          "kind": "Model",
+          "source_change_dispatchers": [
+            { "kind": "Http", "url": "http://localhost", "port": 9000, "timeout_seconds": 60 }
+          ],
+          "model_data_generator": { "kind": "BuildingHierarchy", "change_count": 100000, "seed": 123456789, "...": "..." },
+          "subscribers": [{ "node_id": "default", "query_id": "building-comfort" }]
+        }],
+        "reactions": [{
+          "test_reaction_id": "building-comfort",
+          "output_handler": { "kind": "Http", "port": 9001, "path": "/reaction", "correlation_header": "X-Query-Sequence" },
+          "stop_triggers": [{ "kind": "RecordCount", "record_count": 100000 }]
+        }],
 
-```bash
-cargo run -p test-service -- --test-config test-config.yaml --pattern patterns/drasi-lib-memory.yaml
-```
-
-The **test config** (`test-config.yaml`) contains only the target-agnostic parts — the data model generator, query definitions, reaction observers, and stop triggers. Dispatchers and handlers are left empty for the pattern file to fill in:
-
-```yaml
-# test-config.yaml — central test definition, same for all targets
-test_id: building_comfort
-version: 1
-description: Building comfort monitoring with room temperature, humidity, and CO2
-
-sources:
-  - test_source_id: facilities-db
-    kind: Model
-    source_change_dispatchers: []       # filled in by pattern file
-    model_data_generator:
-      kind: BuildingHierarchy
-      seed: 123456789
-      change_count: 100000
-      spacing_mode: none
-      time_mode: "2025-01-03T10:03:15.4Z"
-      building_count: [1, 0]
-      floor_count: [1, 0]
-      room_count: [1, 0]
-      room_sensors:
-        - kind: NormalFloat
-          id: temperature
-          momentum_init: [5, 1, 0.5]
-          value_change: [1, 0]
-          value_init: [5000, 0]
-          value_range: [0, 10000]
-        # ... co2, humidity sensors ...
-
-reactions:
-  - test_reaction_id: building-comfort
-    output_handler: {}                  # filled in by pattern file
-    stop_triggers:
-      - kind: RecordCount
-        record_count: 90000
-```
-
-A **pattern file** for drasi-lib (`patterns/drasi-lib-memory.yaml`) supplies the dispatchers, handlers, engine config, and runtime settings:
-
-```yaml
-# patterns/drasi-lib-memory.yaml
-drasi_servers:
-  - id: drasi-lib-instance
-    config:
-      storage:
-        type: memory
-      sources:
-        - id: facilities-db
-          source_type: application
-          auto_start: true
-      queries:
-        - id: all-rooms
-          query: "MATCH (r:Room) RETURN elementId(r) AS RoomId, r.temperature, r.humidity, r.co2"
-          sources: [facilities-db]
-          auto_start: true
-      reactions:
-        - id: building-comfort-alerts
-          reaction_type: application
-          queries: [all-rooms]
-          auto_start: true
-
-source_dispatchers:
-  facilities-db:
-    kind: DrasiServerChannel
-    drasi_server_id: drasi-lib-instance
-    source_id: facilities-db
-    buffer_size: 2048
-
-reaction_handlers:
-  building-comfort:
-    kind: DrasiServerChannel
-    drasi_server_id: drasi-lib-instance
-    reaction_id: building-comfort-alerts
-    buffer_size: 1024
-
-run:
-  drasi_servers:
-    - test_drasi_server_id: drasi-lib-instance
-      start_immediately: true
-  sources:
-    - test_source_id: facilities-db
-      start_mode: auto
-  reactions:
-    - test_reaction_id: building-comfort
-      start_immediately: true
-      output_loggers:
-        - kind: PerformanceMetrics
+        "drasi_server_instances": [{
+          "test_drasi_server_instance_id": "external-drasi-server",
+          "launch": {
+            "mode": "binary",
+            "binary_path": "../../drasi-server/bin/drasi-server"
+          },
+          "config": {
+            "apiVersion": "drasi.io/v1",
+            "id": "building-comfort-http",
+            "host": "0.0.0.0",
+            "port": 8080,
+            "logLevel": "info",
+            "autoInstallPlugins": true,
+            "verifyPlugins": false,
+            "plugins": [
+              { "ref": "source/http" },
+              { "ref": "reaction/http" }
+            ],
+            "sources": [
+              { "kind": "http", "id": "facilities-db", "autoStart": true, "host": "0.0.0.0", "port": 9000, "timeoutMs": 60000 }
+            ],
+            "queries": [
+              { "id": "building-comfort", "autoStart": true, "queryLanguage": "Cypher", "sources": [{ "sourceId": "facilities-db" }], "query": "MATCH (r:Room) RETURN elementId(r) AS RoomId, r.temperature AS Temperature, r.humidity AS Humidity, r.co2 AS Co2" }
+            ],
+            "reactions": [
+              { "kind": "http", "id": "building-comfort-out", "autoStart": true, "queries": ["building-comfort"], "baseUrl": "http://localhost:9001", "routes": { "building-comfort": { "added": { "method": "POST", "path": "/reaction" }, "updated": { "method": "POST", "path": "/reaction" }, "deleted": { "method": "POST", "path": "/reaction" } } } }
+            ]
+          }
+        }]
+      }]
+    }]
+  },
+  "test_run_host": {
+    "test_runs": [{
+      "test_id": "building_comfort",
+      "test_repo_id": "drasi_server_dev_repo",
+      "test_run_id": "test_run_001",
+      "drasi_server_instances": [{ "test_drasi_server_instance_id": "external-drasi-server", "start_immediately": true }],
+      "sources": [{ "test_source_id": "facilities-db", "start_mode": "auto" }],
+      "reactions": [{ "test_reaction_id": "building-comfort", "start_immediately": true, "output_loggers": [{ "kind": "PerformanceMetrics" }] }]
+    }]
+  }
+}
 ```
 
-A **pattern file** for drasi-server (`patterns/server-grpc-memory.yaml`) uses gRPC dispatchers with no embedded engine:
+The `gRPC` variant would only differ in the inner `plugins`/`sources`/`reactions` blocks and the matching `source_change_dispatchers`/`output_handler` kinds. Switching between a pre-built binary and a `cargo run` build is just a change to the `launch` block:
 
-```yaml
-# patterns/server-grpc-memory.yaml
-source_dispatchers:
-  facilities-db:
-    kind: Grpc
-    host: localhost
-    port: 50051
-    source_id: facilities-db
-    timeout_seconds: 60
-
-reaction_handlers:
-  building-comfort:
-    kind: Grpc
-    host: 0.0.0.0
-    port: 50052
-    query_ids: [all-rooms]
-    correlation_metadata_key: x-query-sequence
-
-# The referenced server-config-memory.yaml must declare a query with id `all-rooms`
-# (matching the query id used by all patterns for this test scenario).
-drasi_server_config: server-config-memory.yaml
-
-run:
-  sources:
-    - test_source_id: facilities-db
-      start_mode: auto
-  reactions:
-    - test_reaction_id: building-comfort
-      start_immediately: true
-      output_loggers:
-        - kind: JsonlFile
-        - kind: PerformanceMetrics
+```json
+"launch": {
+  "mode": "cargo",
+  "manifest_path": "../../drasi-server/Cargo.toml",
+  "release": true
+}
 ```
-
-**How the merge works.** When the ETF loads both files, it:
-
-1. Takes the test config as the base (sources, reactions, stop triggers, data model)
-2. Injects `source_dispatchers` from the pattern file into each source by matching on `test_source_id`
-3. Injects `reaction_handlers` from the pattern file into each reaction by matching on `test_reaction_id`
-4. Injects the `drasi_servers` block (if present) into the test definition
-5. Uses the `run` section from the pattern file as the `test_run_host` config
-6. Wraps both in the `data_store` / `test_repos` boilerplate automatically
-
-**What this enables:**
-
-- Adding a new test scenario means writing one `test-config.yaml` — no per-target duplication
-- Adding a new target pattern means writing one pattern file — no test logic duplication
-- Changing a test's data model or query updates one file that all patterns share
-- The pattern files are small and focused (dispatchers + engine config only)
-
-**ETF changes required:**
-
-- Replace the existing `--config` CLI argument with `--test-config <path>` and `--pattern <path>`. The existing self-contained config files will be migrated to the new two-file layout as part of this change.
-- A config merge function that combines the two files as described above
 
 ---
 
@@ -207,7 +122,7 @@ run:
 
 This section describes the **proposed** approach for how the ETF should consume each target going forward. The "Test Framework Requirements" section above describes today's behavior; this section describes where we want to land.
 
-**drasi-lib.** The ETF consumes drasi-lib via the `drasi-core` git submodule in the `test-infra` repo. The `test-run-host` crate depends on it as a Cargo path dependency, so drasi-lib is compiled directly into the test-service binary. Tests use `DrasiServerChannel` dispatchers for zero-network in-process communication. To test a different version, update the submodule pointer.
+**drasi-lib.** The ETF consumes drasi-lib via the `drasi-core` git submodule in the `test-infra` repo. The `test-run-host` crate depends on it as a Cargo path dependency, so drasi-lib is compiled directly into the test-service binary. To test a different version, update the submodule pointer.
 
 **drasi-server.** The drasi-server binary is obtained in one of two ways depending on the trigger:
 
