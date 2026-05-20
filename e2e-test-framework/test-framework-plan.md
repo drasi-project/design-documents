@@ -151,11 +151,9 @@ We need a defined test suite for drasi-platform, drasi-server, and drasi-lib tha
 
 The test suite should exercise a variety of source, query, and reaction configurations. The scenarios to cover include:
 
-- Different source and bootstrap types (model-generated synthetic data, script-replayed recorded data)
+- Different source and bootstrap types (model-generated synthetic data, script-replayed recorded data) — see [Replace ETF Script Bootstrap with the Drasi `scriptfile` Bootstrap Provider](#replace-etf-script-bootstrap-with-the-drasi-scriptfile-bootstrap-provider)
 - Multi-source queries with synthetic joins
 - Fan-out topologies (one source feeding multiple queries)
-
-It is worth noting that drasi-platform, drasi-server, and drasi-lib have different available sources and reactions. For example, drasi-lib and drasi-server can use the `scriptfile` bootstrap provider to load initial data directly from local JSONL files, but the Kubernetes-based drasi-platform cannot access local files — it requires the test infrastructure to bootstrap data by streaming it through the ETF's source dispatchers.
 
 ### Query Indexes
 
