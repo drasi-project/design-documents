@@ -324,7 +324,7 @@ After each test run, the ETF (or a post-processing script) should produce a sing
 
 Today, when a test uses recorded data (as opposed to model-generated data), the ETF handles bootstrapping itself: the `Script` kind source has a `bootstrap_data_generator` that reads script files and dispatches them as source change events through the ETF's dispatchers. This means the ETF is responsible for converting script data into the right format, managing the bootstrap phase, and coordinating the handoff to streaming changes. The Drasi engine (drasi-lib or drasi-server) sees these as regular source change events — it has no awareness that a bootstrap is happening.
 
-Drasi Server and drasi-lib now support a native `scriptfile` bootstrap provider — a Drasi plugin that loads initial data from JSONL files directly during query startup, before streaming begins:
+Drasi Server and drasi-lib now support a native `scriptfile` bootstrap provider — a Drasi plugin that loads initial data from JSONL files directly during query startup:
 
 ```yaml
 # Drasi server-config.yaml or drasi-lib config
