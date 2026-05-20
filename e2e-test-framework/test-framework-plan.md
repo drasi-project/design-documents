@@ -2,14 +2,25 @@
 
 * Project Drasi — April 29, 2026 — Ruokun Niu (@ruokun-niu)
 
-## Test Framework Requirements
+## Executing the Test Framework
 
+**Runnable manually.** Developers must be able to run the full test suite from their local machine or as a Github Actions workflow (triggered via `workflow_dispatch`). The existing building_comfort examples in the [test-infra](https://github.com/drasi-project/test-infra) repo demonstrate three distinct run patterns. For each, the description below covers both today's behavior and the proposed direction.
 
-**Runnable manually.** Developers must be able to run the full test suite from their local machine or as a Github Actions workflow (triggered via `workflow_dispatch`). The existing building_comfort examples in the [test-infra](https://github.com/drasi-project/test-infra) repo demonstrate three distinct run patterns:
+- **drasi-lib (in-process).**
+  - *Today:* A single shell script runs the test-service with drasi-lib compiled in — no external processes needed. The script invokes `cargo run --release --manifest-path ./test-service/Cargo.toml -- --config <config.json>` from the `e2e-test-framework` directory. Everything runs in one process.
+  - *Proposed:* The ETF continues to consume drasi-lib via the `drasi-core` git submodule in the `test-infra` repo. The `test-run-host` crate depends on it as a Cargo path dependency, so drasi-lib is compiled directly into the test-service binary. To test a different version, update the submodule pointer.
 
-- **drasi-lib (in-process):** A single shell script runs the test-service with drasi-lib compiled in — no external processes needed. The script invokes `cargo run --release --manifest-path ./test-service/Cargo.toml -- --config <config.json>` from the `e2e-test-framework` directory. Everything runs in one process.
-- **Drasi Server (standalone):** A shell script first builds and starts the drasi-server binary (from a sibling `../../drasi-server` directory) with a `server-config.yaml`, waits for its health check, and then starts the test-service with a separate `config.json` that dispatches changes via HTTP or gRPC to the running server. Currently it can use either a prebuilt binary or execute `cargo run` from a `drasi-server` repo. It is also worth noting that we have four variants of the drasi-server pattern: http, http adaptive, grpc and grpc adaptive.
-- **Drasi Platform (Kubernetes):** Assumes an already-running Kubernetes cluster (the user supplies the kubeconfig; the example does not provision one). The test-service is deployed as a pod alongside Drasi Platform, and the run script uses `kubectl port-forward` to expose the test-service's API endpoint locally. Tests are then controlled via REST API calls (using `curl` or `.http` files) against that port-forwarded endpoint. Each query container index backend is a separate example directory with its own self-contained config (`query_container_default`, `query_container_memory`, `query_container_redis`, `query_container_rocks`).
+- **Drasi Server (standalone).**
+  - *Today:* A shell script first builds and starts the drasi-server binary (from a sibling `../../drasi-server` directory) with a `server-config.yaml`, waits for its health check, and then starts the test-service with a separate `config.json` that dispatches changes via HTTP or gRPC to the running server. It can use either a prebuilt binary or execute `cargo run` from a `drasi-server` repo. There are four variants of this pattern: http, http adaptive, grpc, and grpc adaptive.
+  - *Proposed:* The drasi-server binary is obtained in one of two ways depending on the trigger:
+    - **Release validation and scheduled runs.** The run script pulls a pre-built drasi-server binary from GitHub Releases (or the published Docker image). This exercises the same artifact users consume.
+    - **`pull_request` runs.** The run script builds drasi-server from source with `cargo run` against a checked-out `drasi-server` repo (typically a sibling working copy or a checkout pinned by the workflow). This lets PRs against drasi-server validate changes before any release exists.
+
+    In both cases the server config is supplied by the consolidated `config.json` (see "Proposed Changes" below) rather than a separate `server-config.yaml`, and the ETF takes over the start/health-check/stop lifecycle for the server process.
+
+- **Drasi Platform (Kubernetes).**
+  - *Today:* Assumes an already-running Kubernetes cluster (the user supplies the kubeconfig; the example does not provision one). The test-service is deployed as a pod alongside Drasi Platform, and the run script uses `kubectl port-forward` to expose the test-service's API endpoint locally. Tests are then controlled via REST API calls (using `curl` or `.http` files) against that port-forwarded endpoint. Each query container index backend is a separate example directory with its own self-contained config (`query_container_default`, `query_container_memory`, `query_container_redis`, `query_container_rocks`).
+  - *Proposed:* The overall deployment model stays the same (test-service pod + `kubectl port-forward` to its REST API). Two changes: (1) the framework optionally provisions a local kind cluster automatically when no kubeconfig is provided, so runs do not require an already-running cluster — for CI this becomes the default since it needs no external infrastructure; (2) the per-index-backend example directories (`query_container_memory`, `query_container_redis`, `query_container_rocks`, ...) are collapsed into a single test config plus per-backend pattern files (`platform-memory.yaml`, `platform-redis.yaml`, `platform-rocksdb.yaml`). Provisioning and tearing down a managed cluster (e.g., AKS) within a GitHub Actions workflow is possible but adds a lot of complexity, so it is not part of the default flow.
 
 Each example provides both `run_debug.sh` and `run_release.sh` scripts. For CI, the same scripts (or equivalent `workflow_dispatch` triggers) can be used in GitHub Actions.
 
@@ -116,22 +127,7 @@ The `gRPC` variant would only differ in the inner `plugins`/`sources`/`reactions
 }
 ```
 
----
-
-## How Each Target Is Consumed
-
-This section describes the **proposed** approach for how the ETF should consume each target going forward. The "Test Framework Requirements" section above describes today's behavior; this section describes where we want to land.
-
-**drasi-lib.** The ETF consumes drasi-lib via the `drasi-core` git submodule in the `test-infra` repo. The `test-run-host` crate depends on it as a Cargo path dependency, so drasi-lib is compiled directly into the test-service binary. To test a different version, update the submodule pointer.
-
-**drasi-server.** The drasi-server binary is obtained in one of two ways depending on the trigger:
-
-- **Release validation and scheduled runs.** The run script pulls a pre-built drasi-server binary from GitHub Releases (or the published Docker image). This exercises the same artifact users consume.
-- **`pull_request` runs.** The run script builds drasi-server from source with `cargo run` against a checked-out `drasi-server` repo (typically a sibling working copy or a checkout pinned by the workflow). This lets PRs against drasi-server validate changes before any release exists.
-
-In both cases the server is started with a `server-config.yaml` (referenced by the pattern file's `drasi_server_config` field), the script waits for its health check, and then the ETF test-service runs separately and dispatches changes to the server via HTTP or gRPC as specified in the pattern file.
-
-**drasi-platform.** The deployment model stays the same as today (test-service deployed as a pod alongside Drasi Platform, controlled via `kubectl port-forward` to its REST API). The proposed changes are: (1) the framework optionally provisions a local kind cluster automatically when no kubeconfig is provided, so runs do not require an already-running cluster — for CI this becomes the default since it needs no external infrastructure; (2) the per-index-backend example directories (`query_container_memory`, `query_container_redis`, `query_container_rocks`, ...) are collapsed into a single test config plus per-backend pattern files (`platform-memory.yaml`, `platform-redis.yaml`, `platform-rocksdb.yaml`). Provisioning and tearing down a managed cluster (e.g., AKS) within a GitHub Actions workflow is possible but adds a lot of complexity, so it is not part of the default flow.
+The existing `drasi-lib` `config.json` already follows this consolidated pattern, so it stays unchanged — a single `config.json` per test suite. For [`drasi-platform`](https://github.com/drasi-project/test-infra/tree/main/e2e-test-framework/examples/building_comfort/drasi_platform), we keep the existing split: standard Drasi resource YAMLs (`source.yaml`, the per-backend `query_container_*` configs, etc.) are applied to the cluster via `kubectl`/`drasi apply`, and a separate test config drives the ETF pod. Embedding Kubernetes resource manifests inside `config.json` would just reinvent `kubectl apply` and obscure the fact that the platform is being exercised through its real deployment surface.
 
 ---
 
