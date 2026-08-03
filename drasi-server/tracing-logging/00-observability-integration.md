@@ -28,10 +28,13 @@ See the [drasi-lib observability design](../../drasi-lib/tracing-logging/00-obse
 
 4. **Operator pushing metrics via OTLP**: An operator runs an OTLP collector and configures Drasi Server to push metrics to it.
 
+5. **Operator monitoring process resource usage**: An operator wants to watch Drasi Server's own memory and CPU consumption to spot leaks or size the container. They enable process metrics and see `process_resident_memory_bytes`, `process_cpu_seconds_total`, `process_open_fds`, and `process_threads` alongside the pipeline metrics on the same Prometheus scrape endpoint (or OTLP stream).
+
 ### Goals
 
 - Install a `tracing::Subscriber` that sends drasi-lib's spans to stdout and optionally to a user-provided OTLP endpoint
 - Install a `metrics::Recorder` that exports drasi-lib's metrics via a Prometheus scrape endpoint or OTLP push to a user-provided endpoint
+- Emit standard process resource metrics (resident/virtual memory, CPU time, open file descriptors, thread count) for the Drasi Server process through the same recorder
 - Make telemetry configuration available via YAML config and environment variable overrides
 - Preserve the existing `ComponentLogLayer` and per-component log streaming API endpoints
 - Preserve the existing `logLevel` configuration
@@ -61,6 +64,7 @@ See the [drasi-lib observability design](../../drasi-lib/tracing-logging/00-obse
 | `opentelemetry-otlp` | `0.13+` | OTLP gRPC exporter | **New dependency** |
 | `opentelemetry_sdk` | `0.20+` | OTel runtime | **New dependency** |
 | `metrics-exporter-prometheus` | `0.16+` | Prometheus scrape endpoint | **New dependency** |
+| `metrics-process` | `2.4+` | Cross-platform process resource metrics (memory, CPU, fds, threads) via the `metrics` facade | **New dependency** |
 
 ### Out of Scope
 
@@ -126,6 +130,7 @@ telemetry:
     serviceName: "drasi-server"           # OTel service.name resource attribute
   metrics:
     backend: prometheus                   # "prometheus" or "otlp"
+    processMetrics: true                  # emit process resource metrics (memory/CPU/fds/threads); default false
     prometheus:
       port: 9090                          # Scrape endpoint port
       path: "/metrics"                    # Scrape path
@@ -166,18 +171,46 @@ On startup, Drasi Server installs a metrics recorder based on the `telemetry.met
 - **`otlp`** — pushes metrics to the configured OTLP endpoint at a configurable interval
 - **Not configured** — no recorder installed, `metrics` facade calls are no-ops
 
-#### 4. Startup Order
+#### 4. Process Resource Metrics
+
+
+When `telemetry.metrics.processMetrics: true`, Drasi Server installs a [`metrics-process`](https://crates.io/crates/metrics-process) `Collector`. This crate is the established, cross-platform (Linux, macOS, Windows, FreeBSD) way to emit Prometheus-standard process metrics through the `metrics` facade. Because it records through the same global `metrics::Recorder` already installed in §3, the process metrics flow to **whatever backend is configured** — Prometheus scrape or OTLP push — with no separate exporter.
+
+The collector emits the standard `process_*` metric family:
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `process_resident_memory_bytes` | gauge | Resident set size (physical memory) |
+| `process_virtual_memory_bytes` | gauge | Virtual memory size |
+| `process_cpu_seconds_total` | counter | Total user + system CPU time |
+| `process_open_fds` | gauge | Open file descriptors |
+| `process_max_fds` | gauge | File descriptor limit |
+| `process_threads` | gauge | OS thread count |
+| `process_start_time_seconds` | gauge | Process start time (Unix epoch) |
+
+Availability of individual metrics varies by platform (e.g., `process_open_fds` is not available on Windows); `metrics-process` handles this per-OS and simply omits unsupported metrics.
+
+**Naming convention**: These use the standard Prometheus `process_*` names rather than the `drasi.` prefix used by pipeline metrics. This is a deliberate, scoped rule: the `drasi.` prefix applies to Drasi-domain metrics (what the pipeline is doing — `drasi.query.events_processed`, `drasi.reaction.errors`), while process/host resource metrics follow their established ecosystem convention (`process_*`, what the OS process is consuming). This mirrors what mature stacks do — e.g., the OTel/Prometheus split between application metrics and `process_*`/host metrics — and means Drasi Server's resource metrics are recognized out-of-the-box by existing Grafana/Prometheus process dashboards and alert rules.
+
+**Collection model**: `metrics-process` requires a periodic `collect()` call to refresh values. The collection point depends on the backend:
+- **Prometheus** — call `collector.collect()` inside the `/metrics` scrape handler, so values are refreshed on-demand only when scraped (no idle cost).
+- **OTLP** — spawn a lightweight background task that calls `collector.collect()` once per `exportInterval` before each push.
+
+`processMetrics` requires a metrics backend (`prometheus` or `otlp`) to be configured; with `backend: none` there is no recorder to receive the values and the setting is a no-op. It defaults to `false`, so existing deployments are unaffected.
+
+#### 5. Startup Order
 
 ```
 1. Load config (existing)
 2. Build and install tracing subscriber (NEW)
 3. Install metrics recorder (NEW)
-4. get_or_init_global_registry() (existing)
-5. Build and start DrasiLib instances (existing)
-6. Start Axum API server (existing)
+4. Install process metrics collector — describe() + wire collect() into scrape/push (NEW)
+5. get_or_init_global_registry() (existing)
+6. Build and start DrasiLib instances (existing)
+7. Start Axum API server (existing)
 ```
 
-#### 5. Shutdown
+#### 6. Shutdown
 
 On graceful shutdown (SIGTERM/SIGINT), Drasi Server flushes any pending traces/metrics before exiting.
 
@@ -202,6 +235,7 @@ let server = DrasiServerBuilder::new()
     .with_tracing_service_name("drasi-server")
     .with_metrics_prometheus(9090, "/metrics")
     // or: .with_metrics_otlp("http://otel-collector:4317", 30)
+    .with_process_metrics(true)           // NEW: emit process_* resource metrics
     .with_source(my_source)
     .add_query(query)
     .with_reaction(my_reaction)
@@ -229,6 +263,7 @@ $ drasi-server init --output config/server.yaml
     Metrics backend (prometheus/otlp/none) [none]: prometheus
     Prometheus port [9090]:
     Prometheus path [/metrics]:
+    Collect process resource metrics (memory/CPU)? [y/N]: y
 
   ...
 ```
@@ -257,16 +292,23 @@ Always export to OTLP, require users to run an OpenTelemetry Collector to fan ou
 
 **Rejected because**: For simple deployments (single Docker container), requiring an OTel Collector just to get Prometheus metrics is heavy. Supporting both Prometheus scrape and OTLP push directly lets users choose the simpler option.
 
+#### 4. Use `sysinfo` (or a hand-rolled `/proc` reader) for Process Resource Metrics
+
+Collect process memory/CPU with the general-purpose [`sysinfo`](https://crates.io/crates/sysinfo) crate (or by reading `/proc/self/*` directly) and manually register each value with the `metrics` facade.
+
+**Rejected because**: `sysinfo` is a broad system-inspection crate (enumerates all processes, disks, networks) — heavier than needed and it does not follow Prometheus naming conventions, so we'd have to map fields to metric names by hand and handle per-OS differences ourselves. `metrics-process` is purpose-built for exactly this: it emits the standard `process_*` family, records straight through the `metrics` facade (so it reuses the recorder we already install), and mirrors the official Prometheus `client_golang` implementation across platforms. Hand-rolling a `/proc` reader is even worse — Linux-only and duplicates well-tested code.
+
 ## Security
 
 - **OTLP endpoint**: The OTLP exporter connects to a user-configured endpoint. If the endpoint is remote, users should use TLS. Drasi Server does not enforce TLS — this matches the pattern used by drasi-platform's query-host.
 - **Prometheus endpoint**: The `/metrics` scrape endpoint is unauthenticated. It exposes operational data only (component IDs, event counts, latency). In production, operators should restrict network access to the metrics port.
 - **No secrets in telemetry**: Span fields and metric labels contain component IDs, not user data or credentials.
+- **Process metrics**: The `process_*` metrics expose only OS-level resource counters (memory, CPU, fd/thread counts) for the Drasi Server process. They contain no user data and are gated behind the same unauthenticated scrape endpoint caveat above.
 
 ## Compatibility Impact
 
 - **No breaking changes**: Existing configs without a `telemetry` section work exactly as before.
-- **New dependencies**: `tracing-opentelemetry`, `opentelemetry-otlp`, `metrics-exporter-prometheus` are added to the binary. They are only active when configured.
+- **New dependencies**: `tracing-opentelemetry`, `opentelemetry-otlp`, `metrics-exporter-prometheus`, `metrics-process` are added to the binary. They are only active when configured.
 - **`get_or_init_global_registry()` interaction**: May require a minor refactor in drasi-lib to support composing `ComponentLogLayer` into an externally-built subscriber.
 
 ## Supportability
@@ -279,6 +321,7 @@ Always export to OTLP, require users to run an OpenTelemetry Collector to fan ou
 | OTLP tracing | Integration | Configure endpoint to mock OTLP receiver; verify spans arrive |
 | Prometheus scrape | Integration | Enable Prometheus backend; `curl localhost:9090/metrics`; verify drasi-lib metrics appear |
 | OTLP metrics | Integration | Configure OTLP metrics endpoint; verify metrics arrive at mock receiver |
+| Process metrics | Integration | Enable `processMetrics` with Prometheus backend; `curl localhost:9090/metrics`; verify `process_resident_memory_bytes` and `process_cpu_seconds_total` appear with non-zero values |
 | Env var override | Unit | Set `OTEL_ENDPOINT` env var; verify config resolves correctly |
 | Shutdown flush | Integration | Send SIGTERM; verify pending spans are exported before exit |
 | Unreachable endpoint | Integration | Configure non-existent OTLP endpoint; verify server starts gracefully, logs warning |
@@ -288,11 +331,12 @@ Always export to OTLP, require users to run an OpenTelemetry Collector to fan ou
 | Phase | Work Items |
 |-------|-----------|
 | 1. Config types | Add `TelemetryConfig`, `TracingConfig`, `MetricsConfig` structs to `config/types.rs` with serde deserialization + env var interpolation |
-| 2. Dependencies | Add `tracing-opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk`, `metrics-exporter-prometheus` to `Cargo.toml` |
-| 3. Builder API | Add `.with_tracing_endpoint()`, `.with_tracing_service_name()`, `.with_metrics_prometheus()`, `.with_metrics_otlp()` to `DrasiServerBuilder` |
+| 2. Dependencies | Add `tracing-opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk`, `metrics-exporter-prometheus`, `metrics-process` to `Cargo.toml` |
+| 3. Builder API | Add `.with_tracing_endpoint()`, `.with_tracing_service_name()`, `.with_metrics_prometheus()`, `.with_metrics_otlp()`, `.with_process_metrics()` to `DrasiServerBuilder` |
 | 4. Tracing setup | Implement `init_tracing()` — compose Registry with fmt + ComponentLogLayer + optional OTLP layer. Resolve `get_or_init_global_registry()` interaction |
 | 5. Metrics setup | Implement `init_metrics()` — Prometheus scrape endpoint and OTLP push |
-| 6. `init` CLI | Extend `drasi-server init` with telemetry prompts (OTLP endpoint, service name, metrics backend, Prometheus port) |
+| 5a. Process metrics | Install `metrics-process` `Collector` when `processMetrics` is enabled; wire `collect()` into the Prometheus scrape handler and/or the OTLP push interval |
+| 6. `init` CLI | Extend `drasi-server init` with telemetry prompts (OTLP endpoint, service name, metrics backend, Prometheus port, process metrics) |
 | 7. Shutdown | Add tracer provider shutdown to the existing graceful shutdown handler |
 | 8. Tests | Integration tests for each backend config + graceful degradation |
 | 9. Documentation | Update Drasi Server docs with telemetry configuration reference |
@@ -305,7 +349,7 @@ Always export to OTLP, require users to run an OpenTelemetry Collector to fan ou
 
 ### Future Consideration: Server-Level Metrics
 
-Beyond drasi-lib's pipeline metrics (source events, query processing, reaction delivery), a future iteration could add Drasi Server's own operational metrics for remote monitoring and management — e.g., `drasi.server.uptime_seconds`, `drasi.server.sources_total` (by status), `drasi.server.api_requests_total`, `drasi.server.api_request_duration_ns`, `drasi.server.config_saves_total`. These would be recorded in Axum middleware and server lifecycle code (not in drasi-lib) and flow to whatever recorder the telemetry config installs. This is not in scope for this design but is a natural next step once the telemetry infrastructure is in place.
+Beyond drasi-lib's pipeline metrics (source events, query processing, reaction delivery) and the process resource metrics added by this design (`process_*` from `metrics-process`), a future iteration could add Drasi Server's own *application-level* operational metrics for remote monitoring and management — e.g., `drasi.server.uptime_seconds`, `drasi.server.sources_total` (by status), `drasi.server.api_requests_total`, `drasi.server.api_request_duration_ns`, `drasi.server.config_saves_total`. These are distinct from process resource metrics: they describe application state and API traffic rather than OS-level resource usage. They would be recorded in Axum middleware and server lifecycle code (not in drasi-lib) and flow to whatever recorder the telemetry config installs. This is not in scope for this design but is a natural next step once the telemetry infrastructure is in place.
 
 ## References
 
