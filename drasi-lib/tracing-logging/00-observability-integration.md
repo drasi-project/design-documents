@@ -113,7 +113,7 @@ Spans are placed at the boundaries of each pipeline stage. They form a **single 
 
 **Today**: drasi-lib's pipeline runs across 3 independent tokio tasks connected by async channels. By default, `tracing` spans don't propagate across channel boundaries — each task would create an unrelated root span, resulting in 3 disconnected traces per event instead of one.
 
-**Proposed Solution**: When a span is created in one task, we capture a lightweight `tracing::Span` handle and carry it through the channel alongside the event data. The downstream task then creates its span as a child of the carried handle using `follows_from` or by entering the parent span's context. This produces a single trace tree:
+**Proposed Solution**: When a span is created in one task, we capture a lightweight `tracing::Span` handle and carry it through the channel alongside the event data. The downstream task then creates its span with the carried handle as its **explicit parent** (`info_span!(parent: &carried_span, ...)`), producing true parent-child nesting. We use explicit parent-child throughout — **not** `follows_from`: the carried handle keeps the parent span alive until the child is created, so the child records the parent's span ID and the trace renders as the nested tree shown below (`follows_from` would produce loose causal links rather than the nesting the diagrams depict). This produces a single trace tree:
 
 ```
 Single trace per event (connected across task boundaries):
@@ -168,6 +168,18 @@ source.dispatch { source_id=postgres-src, element_id=Order:42 }          ← roo
 
 All branches share the same `trace_id` with `source.dispatch` as the root. In Jaeger this renders as a single expandable trace tree. When no `tracing::Subscriber` is installed, all `info_span!()` calls compile to no-ops — zero allocation, zero cost. When a subscriber is installed, the cost is proportional to the pipeline topology that the user explicitly configured. Each span is ~200 bytes in a typical subscriber (span name + fields + timestamps).
 
+##### Canonical Span Names
+
+These five span names are authoritative and used consistently throughout this document — the pipeline instrumentation introduces no other span names:
+
+| Span | Task | Key fields |
+|------|------|-----------|
+| `source.dispatch` | Source plugin (T1) | `source_id`, `op`, `label`, `element_id` |
+| `query.receive` | Query forwarder (T2) | `source_id`, `query_id` |
+| `query.process` | Event processor (T3) | `query_id`, `source_id` |
+| `query.dispatch` | Event processor (T3) | `query_id`, `added`, `updated`, `deleted` |
+| `reaction.receive` | Reaction forwarder (T4) | `reaction_id`, `query_id` |
+
 #### 3. Pipeline Stages and Instrumentation Points
 
 The pipeline runs across 5 tokio tasks connected by channels and priority queues. Each arrow (`──▶`) crosses a task boundary:
@@ -195,7 +207,7 @@ Source Plugin ──▶ Query Forwarder ──▶ Query Processor ──▶ Reac
 
 #### 4. Trace Context Propagation Across Channels
 
-To link spans across task boundaries, we carry a `tracing::Span` handle through the channel alongside the event data. The downstream task uses `follows_from` to establish the causal relationship.
+To link spans across task boundaries, we carry a `tracing::Span` handle through the channel alongside the event data. The downstream task creates its span with that handle as its **explicit parent**, establishing parent-child nesting (see Section 2).
 
 ##### Where to put `parent_span`: wrapper vs event
 
@@ -206,10 +218,11 @@ Trace context needs to cross two types of channel boundaries:
 
 **Design**: Use different strategies for each boundary:
 
-| Boundary | Strategy |
-|----------|----------|
-| **PriorityQueue** | Add `parent_span: Option<Span>` to `PriorityQueueEvent<T>` (the wrapper) |
-| **ChangeDispatcher** | Add `parent_span: Option<Span>` to the dispatched result type (`QueryResult`) |
+| Boundary | Carrier | Strategy |
+|----------|---------|----------|
+| **PriorityQueue** (T2→T3, T4→T5) | `PriorityQueueEvent<T>` wrapper | Add `parent_span: Option<Span>` to the wrapper |
+| **ChangeDispatcher — source events** (T1→T2) | `SourceEventWrapper` | Add `parent_span: Option<Span>` to the wrapper |
+| **ChangeDispatcher — query results** (T3→T4) | `QueryResult` | Add `parent_span: Option<Span>` to the dispatched type |
 
 **PriorityQueue wrapper** (carries span alongside the event, not inside it):
 
@@ -223,9 +236,20 @@ struct PriorityQueueEvent<T> {
 
 This preserves the zero-copy property: `Arc<T>` is cloned (just a refcount bump) when needed, but `T` itself is never cloned. The `parent_span` lives on the wrapper and is consumed when the event is dequeued — it does not add to the shared `Arc<T>` allocation.
 
-**ChangeDispatcher path** (for query results crossing to reaction forwarders):
+**ChangeDispatcher path** — the `ChangeDispatcher` is used for two boundaries, so both carriers get a `parent_span` field:
 
-`QueryResult` gains an optional span field:
+Source events (T1→T2) — `SourceEventWrapper` gains the field so the `source.dispatch` span propagates to `query.receive` (field names illustrative):
+
+```rust
+// SourceEventWrapper (channels/events.rs)
+pub struct SourceEventWrapper {
+    pub source_id: String,
+    pub change: Arc<SourceChange>,
+    pub parent_span: Option<tracing::Span>,  // NEW: carries source.dispatch span; None when no tracing backend
+}
+```
+
+Query results (T3→T4) — `QueryResult` gains the field so the `query.dispatch` span propagates to `reaction.receive`:
 
 ```rust
 // QueryResult (queries/manager.rs or channels/events.rs)
@@ -239,7 +263,7 @@ pub struct QueryResult {
 }
 ```
 
-At each task boundary, the downstream task creates its span and links it to the carried `parent_span` using `follows_from`. This produces the connected trace tree shown in Section 2.
+At each task boundary, the downstream task creates its span with the carried `parent_span` as its **explicit parent** (`info_span!(parent: carried_span, ...)`). This produces the connected trace tree shown in Section 2.
 
 #### 5. Metrics Definitions
 
@@ -250,8 +274,11 @@ The metrics below are organized by the pipeline interval they measure (see Secti
 | Metric | Labels | Interval | Where Recorded |
 |--------|--------|----------|----------------|
 | `drasi.source.dispatch_duration_ns` | `source_id` | A | `SourceBase::dispatch_source_change()` — time to wrap and dispatch event |
+| `drasi.query.ingest_wait_ns` | `query_id`, `source_id` | B | Query forwarder — time event spent in the source→query dispatcher channel (dequeue − dispatch, from `ProfilingMetadata` timestamps) |
+| `drasi.query.queue_wait_ns` | `query_id` | C | Event processor — time event waited in the priority queue before processing (dequeue − enqueue) |
 | `drasi.query.engine_duration_ns` | `query_id` | D | Event processor — time inside `process_source_change()` only |
 | `drasi.query.dispatch_duration_ns` | `query_id` | E | `dispatch_query_results()` — time to convert results + dispatch to channels |
+| `drasi.reaction.dispatch_wait_ns` | `reaction_id`, `query_id` | F | Reaction forwarder — time result spent in the query→reaction dispatcher channel |
 | `drasi.reaction.enqueue_duration_ns` | `reaction_id`, `query_id` | G (partial) | Reaction forwarder — time for `enqueue_query_result()` |
 
 **Counters** (throughput and errors):
@@ -264,6 +291,15 @@ The metrics below are organized by the pipeline interval they measure (see Secti
 | `drasi.query.errors` | `query_id`, `error_type` | Query engine errors | Event processor on `process_source_change` error |
 | `drasi.reaction.events_enqueued` | `reaction_id`, `query_id` | Results enqueued to reaction | Reaction forwarder after `enqueue_query_result()` |
 | `drasi.reaction.errors` | `reaction_id`, `error_type` | Reaction enqueue errors | Reaction forwarder on `enqueue_query_result()` error |
+
+**Gauges** (queue depth / in-flight work):
+
+| Metric | Labels | What | Where Recorded |
+|--------|--------|------|----------------|
+| `drasi.query.queue_depth` | `query_id` | Current number of events in the query's priority queue | Updated on enqueue/dequeue in `PriorityQueue` |
+| `drasi.reaction.queue_depth` | `reaction_id` | Current number of results in the reaction's priority queue | Updated on enqueue/dequeue in `PriorityQueue` |
+
+The queue-depth gauges satisfy the queue-depth goal in the Objectives and are updated at the same enqueue/dequeue points as the `queue_wait_ns` / `dispatch_wait_ns` histograms, so they add no extra hot-path work.
 
 #### 6. Interaction with Existing ComponentLogLayer
 
@@ -315,6 +351,8 @@ pub struct FfiCompletedSpan {
 ```
 
 **Ownership contract**: The plugin allocates all memory (`name`, `fields`). Pointers are valid only for the duration of the callback — the host must copy any data it needs before the callback returns. The plugin frees the memory after the callback returns. This is the same ownership model used by the existing `FfiLogEntry` callback.
+
+**Host-side reconstruction**: The host cannot construct a `tracing::Span` with a foreign `trace_id`/`span_id` or preset start/end timestamps — the `tracing` API deliberately does not expose span-ID or timing control. So plugin spans are **not** re-created as `tracing` spans. Instead, the host bridges each `FfiCompletedSpan` directly into the OpenTelemetry SDK it already runs for the pipeline: it constructs an `opentelemetry_sdk::export::trace::SpanData` (setting `span_context` from the plugin's `trace_id` + `span_id`, `parent_span_id`, `start_time`/`end_time` from the `*_ns` fields, and attributes from `fields`) and hands it to the same `SpanExporter` / OTLP pipeline that exports the host's `tracing-opentelemetry` spans. Because the plugin span carries the host-injected `trace_id` and a `parent_span_id` pointing at the live pipeline span, the exported plugin span nests under the pipeline trace with no correlation guesswork. This bridge runs entirely on the host side, so the host retains full control over filtering and sampling before export — plugins never touch the exporter directly.
 
 This means plugin spans appear as children of the pipeline trace. For example, a source plugin's `wal_parse` span becomes a child of `source.dispatch`, and a reaction plugin's `mqtt_publish` span becomes a child of `reaction.receive`:
 
@@ -404,7 +442,7 @@ Create spans only within each task's scope and don't carry trace context through
 - **Trace B**: `query.process` → `query.dispatch` (event processor task)
 - **Trace C**: `reaction.receive` (reaction forwarder task)
 
-**Rejected because**: The primary value of distributed tracing is following a single event end-to-end. Three disconnected traces per event makes it impossible to correlate what happened to a specific source change across the pipeline — you'd have to manually match them by timestamp and field values. Carrying a span handle through the channel is a small amount of additional data (one `Arc` clone per event) and standard practice in async Rust applications that use channel-based architectures. The `follows_from` relationship in the `tracing` crate exists specifically for this use case.
+**Rejected because**: The primary value of distributed tracing is following a single event end-to-end. Three disconnected traces per event makes it impossible to correlate what happened to a specific source change across the pipeline — you'd have to manually match them by timestamp and field values. Carrying a span handle through the channel is a small amount of additional data (one `Arc` clone per event) and standard practice in async Rust applications that use channel-based architectures. Holding the parent handle across the channel lets each downstream span declare it as an explicit parent, producing the nested tree in Section 2.
 
 
 ## Security
@@ -439,6 +477,7 @@ This design *is* the telemetry story for drasi-lib. After implementation, the fo
 |------|-------|----------|
 | Span creation | Unit | Use `tracing_subscriber::fmt::TestWriter` or `tracing-test` crate to assert that expected spans are created with correct fields when processing a mock source change |
 | Metric recording | Unit | Install `metrics-util::debugging::DebuggingRecorder`, process events, assert counter/histogram values |
+| Wait histograms + queue-depth gauges | Unit | With `DebuggingRecorder`, push events through a mock pipeline; assert `drasi.query.queue_depth` / `drasi.reaction.queue_depth` rise on enqueue and fall on dequeue, and that `ingest_wait_ns` / `queue_wait_ns` / `dispatch_wait_ns` record non-zero samples derived from the stamped `ProfilingMetadata` timestamps |
 | ComponentLogLayer compatibility | Integration | Existing tests for `subscribe_component_logs()` must continue to pass with the new spans in place |
 | Zero-cost when no backend | Unit | Process events without any subscriber/recorder installed; verify no panics, no overhead (benchmark if needed) |
 | End-to-end with OTLP | Manual / Integration | Example app with `tracing-opentelemetry` + Jaeger; verify spans appear in Jaeger UI with correct nesting and fields |

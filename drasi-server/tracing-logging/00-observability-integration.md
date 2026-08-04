@@ -202,10 +202,10 @@ Availability of individual metrics varies by platform (e.g., `process_open_fds` 
 
 ```
 1. Load config (existing)
-2. Build and install tracing subscriber (NEW)
-3. Install metrics recorder (NEW)
-4. Install process metrics collector — describe() + wire collect() into scrape/push (NEW)
-5. get_or_init_global_registry() (existing)
+2. init_component_log_layer() — create the ComponentLogRegistry + `ComponentLogLayer` (CHANGED: replaces get_or_init_global_registry())
+3. Build and install tracing subscriber — compose `ComponentLogLayer` (step 2) + fmt + optional OTLP into one Registry (NEW)
+4. Install metrics recorder (NEW)
+5. Install process metrics collector — describe() + wire collect() into scrape/push (NEW)
 6. Build and start DrasiLib instances (existing)
 7. Start Axum API server (existing)
 ```
