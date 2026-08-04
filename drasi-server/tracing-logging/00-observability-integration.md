@@ -129,7 +129,7 @@ telemetry:
     endpoint: "http://jaeger:4317"       # gRPC OTLP endpoint; omit to disable
     serviceName: "drasi-server"           # OTel service.name resource attribute
   metrics:
-    backend: prometheus                   # "prometheus" or "otlp"
+    backend: prometheus                   # "prometheus", "otlp", or "none" (or omit `metrics` to disable)
     processMetrics: true                  # emit process resource metrics (memory/CPU/fds/threads); default false
     prometheus:
       port: 9090                          # Scrape endpoint port
@@ -169,7 +169,7 @@ On startup, Drasi Server installs a metrics recorder based on the `telemetry.met
 
 - **`prometheus`** — starts an HTTP listener on the configured port exposing a `/metrics` scrape endpoint
 - **`otlp`** — pushes metrics to the configured OTLP endpoint at a configurable interval
-- **Not configured** — no recorder installed, `metrics` facade calls are no-ops
+- **`none`** (or the `metrics` section omitted) — no recorder installed, `metrics` facade calls are no-ops. Tracing can still be enabled independently via `telemetry.tracing`.
 
 #### 4. Process Resource Metrics
 
@@ -291,12 +291,6 @@ Rely on `RUST_LOG` and OpenTelemetry's auto-instrumentation environment variable
 Always export to OTLP, require users to run an OpenTelemetry Collector to fan out to Prometheus/Jaeger/etc.
 
 **Rejected because**: For simple deployments (single Docker container), requiring an OTel Collector just to get Prometheus metrics is heavy. Supporting both Prometheus scrape and OTLP push directly lets users choose the simpler option.
-
-#### 4. Use `sysinfo` (or a hand-rolled `/proc` reader) for Process Resource Metrics
-
-Collect process memory/CPU with the general-purpose [`sysinfo`](https://crates.io/crates/sysinfo) crate (or by reading `/proc/self/*` directly) and manually register each value with the `metrics` facade.
-
-**Rejected because**: `sysinfo` is a broad system-inspection crate (enumerates all processes, disks, networks) — heavier than needed and it does not follow Prometheus naming conventions, so we'd have to map fields to metric names by hand and handle per-OS differences ourselves. `metrics-process` is purpose-built for exactly this: it emits the standard `process_*` family, records straight through the `metrics` facade (so it reuses the recorder we already install), and mirrors the official Prometheus `client_golang` implementation across platforms. Hand-rolling a `/proc` reader is even worse — Linux-only and duplicates well-tested code.
 
 ## Security
 

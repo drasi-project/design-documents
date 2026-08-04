@@ -269,7 +269,7 @@ The metrics below are organized by the pipeline interval they measure (see Secti
 
 The `ComponentLogLayer` is preserved unchanged. It operates as a `tracing_subscriber::Layer` and intercepts tracing events based on span context (`component_id`, `component_type`). The new spans we add carry these same fields, so:
 
-- Events emitted inside a `source.ingest` span that carries `component_id` and `component_type = "source"` will be automatically routed to the correct component's log stream by `ComponentLogLayer`.
+- Events emitted inside a `source.dispatch` span that carries `component_id` and `component_type = "source"` will be automatically routed to the correct component's log stream by `ComponentLogLayer`.
 - The `ComponentLogRegistry` API (`subscribe_component_logs()`, `subscribe_component_events()`) continues to work as before.
 - If the embedding application adds additional `tracing::Subscriber` layers (e.g., `tracing-opentelemetry`), spans flow to both `ComponentLogLayer` AND the external backend. This is standard `tracing` layer composition.
 
@@ -366,7 +366,9 @@ This works identically for built-in and cdylib plugins. For built-in plugins, th
 
 ### API Design
 
-N/A — no changes to the public `DrasiLib` builder API, REST API, or CLI. The instrumentation is purely internal to drasi-lib's pipeline implementation. All new tracing spans and metrics are emitted through facade crates and are transparent to the public API.
+No changes to the public `DrasiLib` builder API, REST API, or CLI. The pipeline instrumentation itself is purely internal — all new tracing spans and metrics are emitted through facade crates and are transparent to callers.
+
+There is one additive change to drasi-lib's public initialization surface: to let embedders (e.g., Drasi Server) compose `ComponentLogLayer` into their own multi-layer subscriber alongside an OTLP layer, drasi-lib will add a public `init_component_log_layer()` helper that returns the layer, and keep `init_default_subscriber()` (current `get_or_init_global_registry()` behavior) for simple embedders. This is a non-breaking, additive API change — existing callers of `get_or_init_global_registry()` continue to work unchanged.
 
 ### Alternatives Considered
 
@@ -398,8 +400,8 @@ Extend the existing `ComponentLogLayer` to also track counters and histograms in
 
 Create spans only within each task's scope and don't carry trace context through the PriorityQueue or ChangeDispatcher channels. Each task would create a root span, producing 3 disconnected traces per event:
 
-- **Trace A**: `source.ingest` (source forwarder task)
-- **Trace B**: `query.process` → `reaction.dispatch` (event processor task)
+- **Trace A**: `source.dispatch` (source forwarder task)
+- **Trace B**: `query.process` → `query.dispatch` (event processor task)
 - **Trace C**: `reaction.receive` (reaction forwarder task)
 
 **Rejected because**: The primary value of distributed tracing is following a single event end-to-end. Three disconnected traces per event makes it impossible to correlate what happened to a specific source change across the pipeline — you'd have to manually match them by timestamp and field values. Carrying a span handle through the channel is a small amount of additional data (one `Arc` clone per event) and standard practice in async Rust applications that use channel-based architectures. The `follows_from` relationship in the `tracing` crate exists specifically for this use case.
@@ -415,7 +417,7 @@ If an embedding application exports traces to an external collector (e.g., Jaege
 
 - **No breaking changes**: The public `DrasiLib` API is unchanged. No new required configuration.
 - **New dependency**: `metrics 0.24` is added to `Cargo.toml`. This is a lightweight facade crate with no transitive dependencies beyond `portable-atomic`.
-- **Behavioral change**: Applications that already have a `tracing::Subscriber` installed will see new spans (`source.ingest`, `query.process`, `reaction.dispatch`) in their output. This is additive and should not break existing behavior.
+- **Behavioral change**: Applications that already have a `tracing::Subscriber` installed will see new spans (`source.dispatch`, `query.process`, `reaction.receive`) in their output. This is additive and should not break existing behavior.
 - **Existing `log` crate usage**: Continues to work. `tracing-log` bridge is preserved.
 
 ## Supportability
@@ -448,7 +450,7 @@ This design *is* the telemetry story for drasi-lib. After implementation, the fo
 
 2. **Bootstrap span granularity**: During bootstrap, `process_source_change` is called once per initial data element (potentially thousands). Should each bootstrap event get its own `query.bootstrap` span, or should there be a single parent span for the entire bootstrap phase with lightweight events per element?
 
-3. **Histogram bucket configuration**: The `metrics` crate leaves bucket configuration to the recorder. Should drasi-lib document recommended histogram buckets for `processing_duration_ns` and `dispatch_duration_ns`, or leave that entirely to the user?
+3. **Histogram bucket configuration**: The `metrics` crate leaves bucket configuration to the recorder. Should drasi-lib document recommended histogram buckets for the duration histograms in §5 (e.g., `drasi.query.engine_duration_ns`, `drasi.query.dispatch_duration_ns`, `drasi.source.dispatch_duration_ns`), or leave that entirely to the user?
 
 4. **Span naming convention**: Should span names use dots (`query.process`) or slashes (`query/process`) or OpenTelemetry-style (`drasi.query.process`)? The current proposal uses dots. This should be consistent with whatever convention drasi-platform adopts.
 
