@@ -4,7 +4,7 @@
 
 ## Overview
 
-Drasi Server is a standalone single-process deployment of Drasi that embeds `drasi-lib`. With the [drasi-lib observability design](../../drasi-lib/tracing-logging/00-observability-integration.md), drasi-lib now emits structured tracing spans and `metrics` crate counters/histograms/gauges through facade APIs — but those are no-ops until the embedding application installs a backend. This design makes Drasi Server that embedding application: it wires up the tracing subscriber and metrics recorder so that drasi-lib's telemetry flows to external backends (OTLP, Prometheus, stdout).
+Drasi Server is a standalone single-process deployment of Drasi that embeds `drasi-lib`. With the [drasi-lib observability design](../../drasi-lib/tracing-logging/00-observability-overview.md) — covering [tracing](../../drasi-lib/tracing-logging/01-tracing.md) and [metrics](../../drasi-lib/tracing-logging/02-metrics.md) — drasi-lib now emits structured tracing spans and `metrics` crate counters/histograms/gauges through facade APIs — but those are no-ops until the embedding application installs a backend. This design makes Drasi Server that embedding application: it wires up the tracing subscriber and metrics recorder so that drasi-lib's telemetry flows to external backends (OTLP, Prometheus, stdout).
 
 Drasi Server does not manage or run telemetry backends for the user. It exports traces via OTLP (OpenTelemetry Protocol), which is accepted by most observability tools — Jaeger, Grafana Tempo, Datadog, Honeycomb, New Relic, AWS X-Ray, Azure Monitor, and others. The user points Drasi Server at any OTLP-compatible endpoint and runs their own backend.
 
@@ -14,7 +14,7 @@ Drasi Server does not manage or run telemetry backends for the user. It exports 
 |------|------------|
 | OTLP | OpenTelemetry Protocol — a standard for exporting traces and metrics to collectors (e.g., Jaeger, Grafana Tempo, Prometheus via OTLP receiver). |
 
-See the [drasi-lib observability design](../../drasi-lib/tracing-logging/00-observability-integration.md) for definitions of facade crate, span, subscriber, and recorder.
+See the [drasi-lib observability overview](../../drasi-lib/tracing-logging/00-observability-overview.md) for definitions of facade crate, span, subscriber, and recorder.
 
 ## Objectives
 
@@ -214,7 +214,7 @@ Availability of individual metrics varies by platform (e.g., `process_open_fds` 
 
 On graceful shutdown (SIGTERM/SIGINT), Drasi Server flushes any pending traces/metrics before exiting.
 
-> **Note**: To compose `ComponentLogLayer` into Drasi Server's subscriber alongside the OTLP layer, drasi-lib's `get_or_init_global_registry()` will be split into two functions (see [drasi-lib design doc, Open Issue #5](../../drasi-lib/tracing-logging/00-observability-integration.md)):
+> **Note**: To compose `ComponentLogLayer` into Drasi Server's subscriber alongside the OTLP layer, drasi-lib's `get_or_init_global_registry()` will be split into two functions (see [drasi-lib observability overview, Open Issue #1](../../drasi-lib/tracing-logging/00-observability-overview.md#open-issues)):
 > - `init_component_log_layer()` — returns the layer for Drasi Server to compose
 > - `init_default_subscriber()` — current behavior for simple embedders
 >
@@ -347,7 +347,9 @@ Beyond drasi-lib's pipeline metrics (source events, query processing, reaction d
 
 ## References
 
-- [drasi-lib observability design](../../drasi-lib/tracing-logging/00-observability-integration.md) — Prerequisite design for tracing spans and metrics in drasi-lib
+- [drasi-lib observability overview](../../drasi-lib/tracing-logging/00-observability-overview.md) — Prerequisite design: shared foundations
+- [drasi-lib tracing design](../../drasi-lib/tracing-logging/01-tracing.md) — The spans Drasi Server exports
+- [drasi-lib metrics design](../../drasi-lib/tracing-logging/02-metrics.md) — The metrics Drasi Server exports
 - [drasi-platform query-host init_tracer() / init_metrics()](https://github.com/drasi-project/drasi-platform/blob/main/query-container/query-host/src/main.rs) — Reference OTLP setup in Drasi for Kubernetes
 - [Drasi Server repository](https://github.com/drasi-project/drasi-server) — Source repository
 - [Drasi Server documentation](https://drasi.io/drasi-server/) — User-facing docs
