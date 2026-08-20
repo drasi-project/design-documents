@@ -206,17 +206,25 @@ without locking it whole.
 > consumers steal samples from each other.** Note this is a hazard *within* a branch only — the
 > exporter has its own independent storage, so the two branches never interfere.
 
-Two ways to resolve it, both of which must be decided before the registry serves histograms to more
-than one consumer:
+Two ways to resolve it:
 
 | Option | Consequence |
 |---|---|
 | **`metrics_util::storage::Summary`** — a quantile sketch with relative-error guarantees | Bounded memory, non-destructive reads, safe for any number of consumers. Raw samples are lost, so exact max and arbitrary re-aggregation are unavailable |
 | **One designated drainer** that `clear_with()`s on the export interval and publishes an immutable snapshot everyone else reads | Keeps raw samples and exact quantiles; adds a snapshot-publishing step and makes every consumer's view as stale as the last drain. This is what `metrics-exporter-prometheus` does internally |
 
-Recommendation: the designated drainer, on the §5.2 export interval. It keeps the exported and
-in-process views identical by construction, which matters because a `/metrics` endpoint and a
-dashboard disagreeing about p99 would be worse than either being slightly stale.
+> **DECIDED: the designated drainer, running on the §5.2 export interval.** It keeps the exported
+> and in-process views identical by construction, which matters because a `/metrics` endpoint and a
+> dashboard disagreeing about p99 would be worse than either being slightly stale. Raw samples are
+> also worth keeping because bucket boundaries are permanently the embedder's choice (Open Issue 2)
+> — a sketch
+> would foreclose re-aggregating them later.
+>
+> **No consumer other than the drainer may call `clear_with()`.** That is the whole of the
+> contract: reads by the `/metrics` handler, the inspection API and the UI all go to the published
+> snapshot, never to the `AtomicBucket`. The same one-reader/idempotent-export rule governs
+> `drasi.queue.depth_max` (§4.2), and for the same reason — these are two instances of one pattern,
+> not two independent decisions.
 
 
 ### 3. Existing Metrics Inventory
@@ -287,9 +295,18 @@ accessor:
 #### 3.3 `ProfilingMetadata` — per-event timestamps, already unconditional
 
 `lib/src/profiling/mod.rs` defines eleven `Option<u64>` nanosecond stamps carried on each event:
-`source_ns`, `reactivator_start_ns`, `reactivator_end_ns` (supplied by the external source);
-`source_receive_ns`, `source_send_ns`, `query_receive_ns`, `query_core_call_ns`,
+`source_ns`, `reactivator_start_ns`, `reactivator_end_ns` (intended to be supplied by the external
+source); `source_receive_ns`, `source_send_ns`, `query_receive_ns`, `query_core_call_ns`,
 `query_core_return_ns`, `query_send_ns`, `reaction_receive_ns`, `reaction_complete_ns`.
+
+> **The first three are never populated.** A repository-wide search finds **zero code that writes
+> `source_ns`, `reactivator_start_ns` or `reactivator_end_ns`** — in `lib/` or in any plugin. They
+> are always `None`. The FFI payload reinforces this: `SourceEventPayload`
+> (`components/plugin-sdk/src/ffi/payload.rs:122`) deliberately omits profiling entirely, commented
+> as "`None` at the point a source emits an event and is populated later by the framework" — so a
+> plugin has no way to supply them even if it wanted to. **Pre-Drasi latency is therefore not
+> measured by anything today**, and any metric or span that claims to show it would be reporting a
+> value that does not exist.
 
 Seven intervals are derived from them: `elapsed_source_to_query`, `elapsed_query_processing`,
 `elapsed_query_to_reaction`, `elapsed_reaction_processing`, `elapsed_total`,
@@ -319,7 +336,7 @@ Confirmed absent by repository-wide search:
 | `lib/src/metrics/` three structs | **Keep and additionally emit.** They serve a different purpose (synchronous in-process inspection for the API/UI); the `metrics` facade adds export. Emit alongside rather than replacing, so the inspection API is unchanged. |
 | `PriorityQueueMetrics` | **Promote.** `current_depth` → `drasi.queue.depth` gauge, `drops_due_to_capacity` → `drasi.queue.drops_total`, `blocked_enqueue_count` → `drasi.queue.blocked_enqueues_total`. Closes the biggest existing gap at almost no cost. |
 | `ProfilingMetadata` stamps | **Reuse as the source of the latency histograms** in §4.2. Already written unconditionally, so no gating change is needed — but the clock source must be fixed first (§5.6). |
-| `ProfilingConfig` / `should_profile()` | **Defect — decide in §5.6.** Zero callers; the configuration implies an opt-in and a sampling rate that do not exist. Either delete it or wire it up, but do not place the exported histograms behind it (§5.5). |
+| `ProfilingConfig` / `should_profile()` | **Delete (§5.6).** Zero callers; the configuration implies an opt-in and a sampling rate that do not exist. Removing it makes the current unconditional behaviour honest, and avoids reintroducing a gate the exported histograms must not sit behind (§5.5). |
 | Profiler Reaction statistics | **Keep unchanged.** Aggregation moves to the recorder for exported metrics; the Profiler stays as a standalone opt-in tool. |
 | `opentelemetry = "0.20"` in `core/Cargo.toml` | **Remove.** Dead dependency, zero references. |
 | Throttled queue `debug!` lines | **Keep** as logs; they become redundant once the gauges are exported, but they are cheap and aid local debugging. |
@@ -369,11 +386,15 @@ be a small closed enum and never a free-form message.
 | `phase` | metrics valid in both phases | `bootstrap` \| `steady` | yes |
 | `plugin_kind` | plugin-emitted metrics | e.g. `postgres`, `http`, `kafka` | no — Appendix A |
 
-> **`phase` is not optional.** `ProfilingConfig` has an `include_bootstrap` flag, but it is dead
-> code (§3.3) and it gated profiling rather than labelling it — so bootstrap latency and
-> steady-state latency currently mix into the same distribution. Bootstrap is bulk load and will
-> dominate the tail. Every latency and throughput metric must be separable by `phase`, and that
-> requires a bootstrap marker on the event envelope.
+> **`phase` is not optional.** Nothing distinguishes bootstrap from steady-state traffic today, so
+> bootstrap latency and steady-state latency mix into the same distribution. Bootstrap is bulk load
+> and will dominate the tail, making the steady-state percentiles — the ones anyone alerts on —
+> unreadable. Every latency and throughput metric must be separable by `phase`.
+>
+> **This is new work.** The only existing hint of the distinction is `ProfilingConfig`'s
+> `include_bootstrap` flag, which is dead code and *gated* profiling rather than labelling it; it is
+> being deleted (§5.6). `phase` requires a bootstrap marker carried on the event envelope, which
+> does not exist.
 
 #### 4.2 The Phase 0 Metric Set
 
@@ -389,17 +410,32 @@ Thirteen metrics, chosen to answer five operational questions:
 | 6 | `drasi.queue.depth` | gauge | `component_kind`, `component_id` | promote (§3.2) | Is it keeping up? |
 | 7 | `drasi.queue.depth_max` | gauge | `component_kind`, `component_id` | promote (§3.2) | Is it keeping up? |
 | 8 | `drasi.queue.blocked_enqueues_total` | counter | `component_kind`, `component_id` | promote (§3.2) | Is it keeping up? |
-| 9 | `drasi.reaction.checkpoint_lag` | gauge | `reaction_id`, `query_id` | promote (§3.1) | Is it keeping up? |
+| 9 | `drasi.reaction.checkpoint_lag_events` | gauge | `reaction_id`, `query_id` | promote (§3.1) | Is it keeping up? |
 | 10 | `drasi.queue.drops_total` | counter | `component_kind`, `component_id` | promote (§3.2) | Is it losing data? |
 | 11 | `drasi.errors_total` | counter | `component_kind`, `component_id`, `error_kind` | new | Is it failing? |
 | 12 | `drasi.query.engine_duration_seconds` | histogram | `query_id` | derive (interval D) | How slow is it? |
-| 13 | `drasi.pipeline.end_to_end_duration_seconds` | histogram | `source_id`, `query_id`, `reaction_id` | derive (A→G) | How slow is it? |
+| 13 | `drasi.pipeline.end_to_end_duration_seconds` | histogram | `query_id`, `phase` | derive (A→G) | How slow is it? |
 
-> **`drasi.queue.depth_max` is reset on read.** Each export reports the high-water mark *for that
-> interval*, not for all time — an all-time maximum stops being informative after the first burst.
-> The underlying `max_depth_seen` field (§3.2) is monotonic, so the exported gauge is the difference
-> since the previous read, and the reset must be atomic with it. See §5.3 for why this metric is in
-> Phase 0 at all.
+> **Metric 13 is deliberately *not* labelled `source_id` or `reaction_id`.** Those three labels
+> multiply rather than add — see [§5.4](#54-cardinality-is-the-constraint-that-actually-bites),
+> where the decision is made and the arithmetic given. Attributing a slow end-to-end path to a
+> specific source–reaction pair is a tracing question, and [01 — Tracing](01-tracing.md) answers it
+> exactly rather than statistically.
+
+> **`drasi.queue.depth_max` reports a windowed maximum, and the reset is internal — not on read.**
+> Each exported value is the high-water mark *for the last observation window*, not for all time; an
+> all-time maximum stops being informative after the first burst. The underlying `max_depth_seen`
+> field (§3.2) is monotonic, so a **single designated sampler inside Drasi** reads-and-resets it on
+> the observation cadence (§5.3) and publishes the result as an ordinary gauge.
+>
+> ⚠️ **It must not reset when the metric is read**, which an earlier draft specified. Under the
+> Phase 0 Prometheus **scrape** branch a "read" is a scrape, and scrape endpoints are not
+> single-consumer: an HA Prometheus pair is a normal deployment, and an operator running `curl`
+> during an incident is another reader. Destructive reads mean each consumer sees only what
+> accumulated since whichever one read last, so the two Prometheus replicas would disagree and the
+> `curl` would silently corrupt both. This is the same defect class as the histogram
+> `clear_with()` steal in [§2](#2-collection-architecture), and it gets the same remedy:
+> **one designated reader, idempotent export.**
 
 Intervals D and A→G are defined in the pipeline model in
 [00 — Overview](00-observability-overview.md#pipeline-model-and-instrumentation-points). Names
@@ -436,13 +472,24 @@ Notes on individual choices:
 - **`drasi.query.results_emitted_total`**, labelled by `change_kind`, answers "is this query actually
   producing output, and of what shape". It has no equivalent today and is the cheapest way to
   distinguish a silent query from an idle source.
-- **`drasi.reaction.checkpoint_lag`** is the single best consumer-health signal Drasi already
+- **`drasi.reaction.checkpoint_lag_events`** is the single best consumer-health signal Drasi already
   computes and never exports.
+  > **The `_events` suffix is doing real work.** The value is a *sequence-number difference* —
+  > the query's latest outbox sequence minus the reaction's checkpoint (§3.1) — so it counts
+  > **events behind**, not time behind. Named bare, `checkpoint_lag` reads as a duration to almost
+  > every operator, and the [naming convention](00-observability-overview.md#naming-and-namespacing-conventions)
+  > puts the unit in the leaf precisely to stop that. A time-based lag is not available as an
+  > alternative: checkpoints carry sequence numbers, not timestamps, so there is nothing to subtract
+  > to get seconds.
 - **`drasi.component.up`** is deliberately trivial — it is the metric every dashboard and alert
   rule starts from.
 - **The two histograms** derive from `ProfilingMetadata` stamps already written on every event
-  (§3.3), so they add no hot-path timing call. Their one prerequisite is the monotonic-clock fix
-  in §5.6. See §5.4 for a recommended change to the `end_to_end` label set.
+  (§3.3), so they add no hot-path timing call. They carry two prerequisites: the monotonic-clock
+  fix in §5.6, and — for `end_to_end` — a bootstrap marker on the event envelope to populate
+  `phase` (§4.1). Neither exists today.
+  > Their **bucket boundaries are the embedder's**, and the Prometheus defaults are the wrong shape
+  > for Drasi's microsecond-scale intervals — see [Open Issue 2](#open-issues) before charting
+  > percentiles off either of these.
 
 **DECIDED — one queue metric family, not two.** A single `drasi.queue.*` family labelled by
 `component_kind` (`query` \| `reaction`) is used, rather than separate `drasi.query.queue_*` and
@@ -471,7 +518,7 @@ The rules that govern it, and every error counter that follows in later phases:
   the instance. The two are not redundant.
 
 Later phases replace this rollup with per-subsystem counters — `drasi.plugin.errors_total` for the
-plugin boundary ([00 — Overview](00-observability-overview.md#tier-1--the-universal-baseline)),
+plugin boundary ([§8.3](#83-tier-1--the-universal-baseline)),
 `drasi.index.errors_total` for storage, and so on — all carrying the same `error_kind` discipline.
 
 
@@ -495,17 +542,48 @@ So the levers that actually control metric cost are:
 |---|---|---|
 | **Reporting interval** | Export volume and downstream storage | §5.2 |
 | **Label cardinality** | Series count — the dominant term | §4.1, Open Issue 1 |
-| **Enablement / profiles** | Which metrics exist at all | [00 — Overview](00-observability-overview.md) |
+| **Enablement / profiles** | Which metrics exist at all | [00 — Overview](00-observability-overview.md#enablement-filtering-and-observability-profiles) |
 | **Observation cadence** | Cost of *reading* expensive gauges | §5.3 |
 
 Sampling appears in none of them.
+
+##### How the profiles map onto this catalogue
+
+The profile vocabulary is defined in
+[00 — Overview](00-observability-overview.md#enablement-filtering-and-observability-profiles). What
+belongs here is the mapping onto the phase tiers this document defines, because **the profile ladder
+and the phase ladder are deliberately the same ordering** — one ranking of importance, used twice
+(release order in §4 and Appendix A, runtime exposure here).
+
+| Profile | Metric set | Series, mid-sized deployment | Notes |
+|---|---|---|---|
+| `off` | none | 0 | No recorder installed; facade calls are no-ops |
+| `basic` | Phase 0 (§4.2) | ~1,700 (§5.4) | The default. Sized to be safe unattended |
+| `debug` | + P1 and P2 (Appendix A) | Highest | Includes expensive gauges — see §5.3 for why cadence must stay decoupled from export |
+| `persistence` | Phase 0 + `drasi.index.` + engine statistics | ~`basic` + backend surface | Crosses tiers rather than extending the ladder; requires collection enabled in the provider constructor, not just a filter (§6.2) |
+
+There is deliberately **no intermediate rung between `basic` and `debug`.** Splitting P1 out as its
+own profile would force a per-metric argument about which side of the line each one falls on, and an
+operator who has already decided `basic` is insufficient is usually diagnosing something and wants
+the full picture. The P1/P2 distinction still governs *release* order in Appendix A, where it costs
+nothing.
+
+Two consequences specific to metrics:
+
+- **`persistence` is the only profile that cannot be satisfied by filtering alone.** Every other
+  profile adds or removes series that are already being produced; `persistence` requires RocksDB
+  `Statistics` to have been switched on before drasi-lib received the provider. §6.2 covers the
+  exposure question, and the ownership rule is in 00 — Overview.
+- **No profile changes sampling, because there is none to change.** Profiles select *which* metrics
+  exist; §5.1 through §5.4 govern what each one costs once selected. A profile that appeared to
+  "reduce sampling" would be selecting a smaller metric set, and should say so.
 
 **Sampling also breaks the metrics that matter most.** `drasi.queue.drops_total` and
 `drasi.errors_total` are
 counters of rare, important events. Sampling at 1% means a single dropped event is 99% likely to be
 invisible, and the reported count is an estimate of a number that must be exact. A metric whose
 entire purpose is to detect silent data loss cannot itself lose data. The same argument applies to
-`drasi.reaction.checkpoint_lag` and `drasi.component.up`, where a sampled reading is simply a stale
+`drasi.reaction.checkpoint_lag_events` and `drasi.component.up`, where a sampled reading is simply a stale
 reading.
 
 **Counters and histograms are already aggregations.** Incrementing a counter is one relaxed atomic
@@ -534,10 +612,19 @@ not a statistical-sampling one, and it has a real consequence for Phase 0:
 > drains within 200ms is invisible at a 10s cadence, yet it is exactly the event an operator needs
 > to see. The instantaneous gauge alone is not sufficient evidence of backpressure.
 
-**DECIDED — `drasi.queue.depth_max` ships in Phase 0** as the thirteenth metric (§4.2), with
-reset-on-read semantics so each export reports the high-water mark *for that interval* rather than
-for all time. The value is already maintained as `max_depth_seen` (§3.2), so the metric costs
-nothing to produce. The two alternatives were considered and rejected as insufficient on their own:
+**DECIDED — `drasi.queue.depth_max` ships in Phase 0** as the thirteenth metric (§4.2), reporting the
+high-water mark *for the last observation window* rather than for all time. The value is already
+maintained as `max_depth_seen` (§3.2), so the metric costs nothing to produce.
+
+**The read-and-reset belongs to one designated sampler inside Drasi, on the observation cadence —
+not to the exporter.** The distinction matters because the two readers have incompatible
+requirements: the sampler *must* reset to produce a per-window figure, while the export path *must*
+be idempotent, since under Prometheus pull it can be invoked by an HA replica pair and an ad-hoc
+`curl` at the same time. Separating them satisfies both; conflating them makes every extra reader
+steal data from the others. The same separation is the recommended answer for histogram reads in
+Open Issue 4.
+
+The two alternatives were considered and rejected as insufficient on their own:
 
 - `drasi.queue.blocked_enqueues_total` and `drasi.queue.drops_total` are counters and therefore lose
   nothing — but they only fire once the queue is *already* full, so they detect saturation rather
@@ -553,19 +640,26 @@ storage engine a thousand times a minute.
 #### 5.4 Cardinality Is the Constraint That Actually Bites
 
 Series count, not sampling, is what determines whether this design scales. For a mid-sized
-deployment of 5 sources, 20 queries and 10 reactions, the Phase 0 set produces roughly 1,200 time
+deployment of 5 sources, 20 queries and 10 reactions, metrics 1–12 produce roughly 1,200 time
 series — comfortable for any backend.
 
-With one exception. **`drasi.pipeline.end_to_end_duration_seconds` as currently specified is
-multiplicative**: labelling it `source_id` × `query_id` × `reaction_id` yields 5 × 20 × 10 = 1,000
-label combinations, and a histogram multiplies that by its bucket count — roughly 12,000 series
-from a single metric, ten times the rest of Phase 0 combined. Worse, it grows as the product of
-deployment size rather than the sum.
+With one exception. **`drasi.pipeline.end_to_end_duration_seconds` was originally specified
+multiplicatively**: labelling it `source_id` × `query_id` × `reaction_id` yields 5 × 20 × 10 = 1,000
+label combinations, and a histogram multiplies that by its bucket count (12 in this sizing) —
+roughly 12,000 series from a single metric, ten times the rest of Phase 0 combined. Worse, it grows
+as the *product* of deployment size rather than the sum, so it degrades fastest on exactly the
+deployments that can least afford it.
 
-> **Recommendation:** label `drasi.pipeline.end_to_end_duration_seconds` with `query_id` and `phase`
-> only. End-to-end latency is charted per query in practice; attribution to a specific
-> source–reaction pair is a tracing question, and [01 — Tracing](01-tracing.md) already answers it
-> exactly. This reduces the metric to ~240 series.
+> **DECIDED: label `drasi.pipeline.end_to_end_duration_seconds` with `query_id` and `phase` only.**
+> End-to-end latency is charted per query in practice; attribution to a specific source–reaction
+> pair is a tracing question, and [01 — Tracing](01-tracing.md) already answers it exactly rather
+> than statistically. The metric becomes 20 queries × 2 phases × 12 buckets ≈ **480 series** — a 25×
+> reduction, and one that now grows linearly with query count instead of as a three-way product.
+>
+> `phase` is retained even though it doubles the count, because it is the one dimension that must
+> never be mixed: bootstrap is bulk load and would otherwise dominate the steady-state tail (§4.1).
+
+With metric 13 corrected, Phase 0 totals roughly **1,700 series** for the sizing above.
 
 #### 5.5 What Existing Instrumentation Should Do
 
@@ -579,7 +673,8 @@ deployment size rather than the sum.
 #### 5.6 Clock Source for Latency Histograms
 
 The latency histograms in §4.2 have **no gating dependency** — the stamps they derive from are
-already written on every event, because `ProfilingConfig` is never consulted (§3.3). What they do
+already written on every event, because `ProfilingConfig` is never consulted (§3.3) — and it is
+being deleted, so no gate will appear later either. What they do
 have is a clock-source problem.
 
 `profiling::timestamp_ns()` returns `SystemTime::now().duration_since(UNIX_EPOCH)`. `SystemTime` is
@@ -596,14 +691,51 @@ histogram an alert fires on.
 | **Add a parallel `Instant` stamp for intervals** | Correct durations; `Instant` is monotonic and cheaper to read. Costs an extra field per stamp point, and `Instant` is not serializable across the FFI boundary or across processes |
 | **`Instant` for intra-process intervals, `SystemTime` retained for cross-process correlation** | Correct and complete, most work — durations come from `Instant`, absolute event times stay `SystemTime` for correlating with an upstream source's timestamps |
 
-Recommendation: the third. Intervals A–G are all intra-process, so they should be measured with
-`Instant`. `SystemTime` is still needed for `source_ns` / `reactivator_*_ns`, which arrive from
-outside the process and can only be wall-clock. The existing `Option<u64>` fields stay as they are;
-the change is that durations stop being computed by subtracting two wall-clock stamps.
+> **DECIDED: the third — two clocks, each used for what it is correct at.** Intervals A–G are all
+> intra-process, so every duration is computed from `Instant`, which is monotonic by construction
+> and cannot produce a negative interval no matter what NTP does. `SystemTime` is retained *only*
+> for absolute event times — `source_ns` / `reactivator_*_ns` — which can only ever be wall-clock
+> because they originate outside the process and must line up with an upstream system's timestamps.
+>
+> The rule that follows is short enough to enforce in review: **never subtract two `SystemTime`
+> stamps to get a duration.** If a duration is wanted, there must be an `Instant` pair for it.
+>
+> Two honest costs. The `Option<u64>` wall-clock fields stay as they are, so `ProfilingMetadata`
+> grows by the `Instant` stamps rather than swapping them in — the struct gets wider on a per-event
+> path. And the cross-process half is **provisioning, not preservation**: `source_ns` and
+> `reactivator_*_ns` are never populated today (§3.3), so retaining `SystemTime` protects a
+> capability Drasi does not yet have. That is deliberate — the alternative is discovering the need
+> after the stamp format is load-bearing.
 
-> **Also to settle here:** whether `ProfilingConfig` should be deleted or actually wired up.
-> Deleting it makes the current behaviour honest. Wiring it up would reintroduce a gating problem
-> for the exported histograms, so if it is wired up it must remain a Profiler-only control (§5.5).
+> **Consequence for `ProfilingConfig`: DECIDED — delete it.** `ProfilingConfig` and
+> `should_profile()` have zero callers, so deleting them changes no behaviour; it only removes a
+> configuration surface that advertises an opt-in and a sampling rate Drasi does not implement.
+> Wiring it up instead would put a gate in front of the very stamps the Phase 0 histograms derive
+> from, which §5.5 rules out. Sampling control for the Profiler Reaction stays where it already
+> lives, in the Profiler's own `sampling_rate` (§5.5).
+>
+> One thing the deletion does *not* solve: `include_bootstrap` was the only existing hint of a
+> bootstrap/steady distinction, and it gated profiling rather than labelling it. The `phase` label
+> (§4.1) still needs a bootstrap marker carried on the event envelope — new work that the deletion
+> neither creates nor removes.
+
+#### 5.7 Export Temporality
+
+✅ **DECIDED: cumulative temporality for Phase 0.**
+
+The choice matters only on a crash or a failed export, and there the two options are not
+comparable. A **cumulative** counter reports an absolute running total, so a missed export is
+self-correcting — the next successful one carries everything the lost one would have. A **delta**
+counter reports only what changed since the last export, so a missed export is permanent data loss
+with nothing to indicate it happened.
+
+Under the Prometheus-scrape branch this is automatic: a scrape reads current values, so cumulative
+is the only thing it can be. That is one more reason scrape is the right P0 default (§2). If an
+OTLP push branch is added later, it must be configured cumulative **explicitly** — the OTLP
+specification permits either, and some backends default to delta.
+
+Crash-loss windows for the other signals are in
+[00 — Overview](00-observability-overview.md#export-flush-and-crash-loss-semantics).
 
 ### 6. Environment and Storage Metrics
 
@@ -715,24 +847,97 @@ a proxy.
 
 #### Exposing embedded-engine statistics
 
-For RocksDB and redb, where Drasi is the only possible exporter:
+For RocksDB and redb, where Drasi is the only possible exporter. **The two engines turned out to be
+nothing alike**, so they get separate answers rather than a shared policy.
 
-- **Opt-in, always.** Enabling RocksDB's `Statistics` has measurable overhead, and it offers levels
-  (`kExceptDetailedTimers`, `kExceptTimeForMutex`, `kAll`). The choice of level should be
-  configuration, not a constant.
-- **Curated by default, verbatim behind a flag.** The curated set covers what a Drasi operator acts
-  on — block cache hit ratio, memtable size, SST bytes on disk, pending compaction bytes, write
-  stall time. Verbatim pass-through stays available as an escape hatch for deep debugging.
-- **Backend-neutral names only where the semantics genuinely match.** `drasi.index.disk_bytes` is
-  safe across every on-disk backend. Anything engine-specific keeps an engine-specific name
+##### RocksDB — cheap typed properties, and one gap caused by the pinned version
+
+`components/indexes/rocksdb/Cargo.toml:32` pins **`rocksdb = "0.21.0"`**, and that version's
+statistics surface is narrower than a reader of the RocksDB C++ docs would expect:
+
+| API | In 0.21? | Notes |
+|---|---|---|
+| `DB::property_int_value(name)` (`db.rs:1840`) | **Yes** | Typed `u64`. Needs no `enable_statistics()`, so it carries none of its overhead |
+| `Options::enable_statistics()` (`db_options.rs:2517`) | Yes | |
+| `Options::get_statistics() -> Option<String>` (`db_options.rs:2523`) | Yes | A **formatted text blob**. Parsing it to get numbers is the only route to tickers on 0.21 |
+| `get_ticker_count()`, `get_histogram_data()`, `set_statistics_level()` | **No** | Arrive in 0.22. ⚠️ An earlier draft of this section specified statistics *levels* (`kExceptDetailedTimers`, `kExceptTimeForMutex`, `kAll`) as configuration — **that is not implementable on the pinned version.** |
+
+So the curated set is mostly reachable through `property_int_value`, which is the cheap path:
+
+| Curated statistic | Property (0.21) | Status |
+|---|---|---|
+| SST bytes on disk | `total-sst-files-size`, `live-sst-files-size` | ✅ typed `u64` |
+| Memtable size | `cur-size-all-mem-tables`, `size-all-mem-tables` | ✅ typed `u64` |
+| Pending compaction bytes | `estimate-pending-compaction-bytes` | ✅ typed `u64` |
+| Write stall | `actual-delayed-write-rate`, `is-write-stopped` | ✅ typed — but a *rate and a flag*, not cumulative stall time |
+| **Block cache hit ratio** | — | ❌ **Not available typed on 0.21.** Only `block-cache-usage` and `block-cache-capacity` (occupancy, not hit rate). Hit/miss needs tickers |
+
+Worth adding while we are here, all typed and cheap: `background-errors`, `compaction-pending`,
+`num-running-compactions`, `estimate-num-keys`.
+
+> **DECIDED — build the curated set on `property_int_value`, and treat block cache hit ratio as
+> blocked rather than dropped.** Four of the five proposed statistics are cheap typed reads that do
+> not require `enable_statistics()` at all, which removes the overhead concern that made this
+> opt-in in the first place — so **the property-derived metrics can ship without a flag**. Hit ratio
+> is the single most operationally useful of the five and the only one that cannot ship: it needs
+> either a bump to `rocksdb 0.22` for `get_ticker_count()`, or parsing the `get_statistics()` text
+> blob, which is a fragile thing to put on a timer. **Recommend the version bump**, alongside the
+> OpenTelemetry version decision in
+> [01 — Tracing](01-tracing.md#t2--the-host-side-and-a-conflict-with-facade-only), and ship the
+> other four meanwhile.
+
+##### redb — eight numbers, and reading them is a blocking full scan
+
+redb 2.6.3 backs the **state store** (`components/state_stores/redb`) and the **WAL**
+(`components/wals/redb`). It is **not** an index backend, so `drasi.index.*` is the wrong namespace
+for it — its metrics belong under `drasi.state_store.*` / `drasi.wal.*`
+([A.10](#a10-storage-index-state-store-and-wal)).
+
+`DatabaseStats` (`src/transactions.rs:300-351`) exposes exactly eight values: `tree_height`,
+`allocated_pages`, `leaf_pages`, `branch_pages`, `stored_bytes`, `metadata_bytes`,
+`fragmented_bytes`, `page_size`. `TableStats` (`src/table.rs:29-55`) offers a per-table subset.
+**There are no cache hit/miss counters, no operation counters and no latency histograms** — redb
+reports *shape*, never *behaviour*.
+
+The surface is not the problem. The access path is:
+
+| Finding | Evidence |
+|---|---|
+| `stats()` exists **only on `WriteTransaction`** | `transactions.rs:2282`, inside `impl WriteTransaction` at `:797`. `ReadTransaction` has no `stats()` at all |
+| redb permits **one writer at a time** | `Database::begin_write()` docs, `db.rs:1022`: *"Only a single write may be in progress at a time. If a write is in progress, this function will block until it completes."* |
+| `stats()` is a **full traversal of every page** | `TableTree::stats()` iterates every table (`table_tree.rs:807`, `range::<RangeFull, &str>`) and `stats_helper` recurses through every leaf and branch page (`btree.rs:950`) |
+
+Together those mean a metrics sampler calling `stats()` would **take the write lock the WAL needs
+and hold it for an O(database size) scan that pulls the entire file through the page cache.** On the
+WAL — the component on the write path — that is a latency injection dressed as observability.
+
+> **DECIDED — never sample redb's `stats()` on a timer.**
+>
+> - **Size comes from the filesystem.** `drasi.wal.size_bytes` and the state store's size are
+>   obtained by stat-ing the database file, which costs nothing and needs no transaction. This is
+>   what [A.10](#a10-storage-index-state-store-and-wal) already specifies (*"from file sizes"*).
+> - **Behaviour comes from Drasi's own instrumentation.** `drasi.wal.append_duration_seconds` and
+>   `drasi.state_store.operation_duration_seconds` are interaction metrics that Drasi times itself
+>   (§6.2) — they need nothing from redb, and they are what an operator actually acts on.
+> - **`fragmented_bytes` is genuinely useful and still does not become a metric.** It is the
+>   signal for "this database wants compacting", but it is only obtainable via the blocking scan.
+>   It belongs in an **on-demand admin/diagnostic operation** an operator invokes deliberately,
+>   never on an interval.
+>
+> The earlier guess — *"redb may offer very little, in which case it gets `disk_bytes` and nothing
+> more"* — reached roughly the right conclusion for the wrong reason. redb offers eight numbers; the
+> reason we decline almost all of them is the cost of reading them, not their absence.
+
+##### What survives as shared policy
+
+- **Backend-neutral names only where the semantics genuinely match.** A size-on-disk gauge is safe
+  across every on-disk backend. Anything engine-specific keeps an engine-specific name
   (`drasi.index.rocksdb.*`) rather than being forced into a shared name that means something
   slightly different per backend.
-- **Read on a timer, not per-operation**, on a cadence decoupled from the export interval per §5.3.
-
-> **OPEN — the curated list itself.** The five curated RocksDB statistics above are a proposal, not
-> an agreed set, and **redb's exposed surface has not been surveyed** — it may offer very little,
-> in which case redb gets `disk_bytes` and nothing more. Both need confirming before A.10 moves out
-> of P2.
+- **Read on a timer, not per-operation**, on a cadence decoupled from the export interval per §5.3
+  — and only for reads that are *actually* cheap, which after this survey means RocksDB properties
+  and `stat()`, not redb's `stats()`.
+- **Verbatim pass-through stays available behind a flag** as an escape hatch for deep debugging.
 
 ### 7. Future: Internal Telemetry as a Drasi Source
 
@@ -744,6 +949,500 @@ exists in the mobility demo proposal and should be cross-referenced rather than 
 depends on the collection architecture chosen in §2, and would require the throttling described in
 §5 so Drasi cannot overload itself with its own metrics.
 
+### 8. Plugin Metrics
+
+**DECIDED — telemetry is a standard capability of every plugin kind, structured as three tiers: a
+universal baseline every plugin gets, a per-kind standard set, and whatever the plugin author adds
+on top. All three land in the same recorder.**
+
+The FFI transport these tiers ride on is described in
+[00 — Overview](00-observability-overview.md#plugin-telemetry-across-ffi); this section defines what
+is actually emitted.
+
+#### 8.1 The plugin kinds
+
+Eight extension points exist. They do **not** all use the same delivery path, because they do not
+all cross the FFI boundary:
+
+| Plugin kind | Registered on `DrasiLibBuilder` as | Loadable as cdylib? |
+|---|---|---|
+| Source | `with_source(impl SourceTrait)` | yes — `SourcePluginVtable` |
+| Reaction | `with_reaction(impl ReactionTrait)` | yes — `ReactionPluginVtable` |
+| Bootstrap provider | `set_bootstrap_provider(Arc<dyn BootstrapProvider>)` on the source | yes — `BootstrapPluginVtable` |
+| Identity provider | `with_identity_provider(Arc<dyn IdentityProvider>)` | yes — `IdentityProviderPluginVtable` |
+| Secret store | `with_secret_store_provider(Arc<dyn SecretStoreProvider>)` | yes — `SecretStorePluginVtable` |
+| Index backend | `with_index_provider(Arc<dyn IndexBackendPlugin>)` | **no** — compile-time only |
+| State store | `with_state_store_provider(Arc<dyn StateStoreProvider>)` | **no** — compile-time only |
+| WAL provider | `with_wal_provider(Arc<dyn WalProvider>)` | **no** — compile-time only |
+
+Two facts drive the whole design:
+
+1. **Every kind arrives at `DrasiLibBuilder` as a trait object.** Whether a source was linked in
+   statically or loaded from a `.so` and wrapped in a host-sdk `SourceProxy`, drasi-lib receives a
+   `Box<dyn SourceTrait>`. This is a single, universal chokepoint that already exists.
+2. **Only sources and reactions receive a host context.** `initialize_fn(state, ctx: *const
+   FfiRuntimeContext)` appears on `SourceVtable` and `ReactionVtable` and on no other vtable.
+   Bootstrap providers, identity providers and secret stores are pure factories — the host calls
+   `create_*_fn(config_json)` and gets back a vtable with one or two methods. **There is no point
+   at which the host hands them `instance_id`, `component_id`, or a callback.**
+
+Fact 1 is what makes tiers 1 and 2a possible for all eight kinds; fact 2 is what dictates how
+tiers 2b and 3 are transported, and it rules out the obvious approach — see
+[§8.6](#86-how-tiers-2b-and-3-reach-the-recorder).
+
+#### 8.2 The three tiers
+
+Tiers 1 and 2 are **guaranteed** — they exist for a plugin whose author wrote no instrumentation at
+all. Tier 3 is the author's own, and is optional.
+
+| Tier | What | Who emits it | Applies to |
+|---|---|---|---|
+| **1 — Universal baseline** | Same handful of metrics for every plugin, whatever its kind | drasi-lib, automatically | all 8 kinds |
+| **2 — Per-kind standard set** | Metrics meaningful for *that* kind: source metrics, reaction metrics, bootstrapper metrics, … | drasi-lib where derivable; plugin where not | all 8 kinds |
+| **3 — Plugin-author metrics** | Whatever the author considers useful about their own internals | the plugin, opt-in | any kind |
+
+**All three tiers land in the same recorder.** For a statically linked plugin the `metrics` macros
+resolve to the host's global recorder directly; for a cdylib plugin they resolve to the plugin's
+own recorder, which is an FFI bridge that forwards to the host's. The destination is identical
+either way, so a dashboard cannot tell how a plugin was linked — which is the point.
+
+#### 8.3 Tier 1 — the universal baseline
+
+drasi-lib wraps each registered trait object in a decorator at the builder. The decorator
+implements the same trait, forwards every call, and records around it:
+
+```rust
+// Applied inside with_source / with_reaction / with_identity_provider / …
+pub fn with_source(mut self, source: impl SourceTrait + 'static) -> Self {
+    let instrumented = InstrumentedSource::new(Box::new(source));
+    self.source_instances.push((Box::new(instrumented), HashMap::new()));
+    self
+}
+```
+
+This yields, uniformly and with no plugin author involvement:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `drasi.plugin.up` | gauge | `plugin_kind`, `component_kind`, `component_id` |
+| `drasi.plugin.calls` | counter | `plugin_kind`, `component_kind`, `component_id`, `operation` |
+| `drasi.plugin.call_duration_seconds` | histogram | `plugin_kind`, `component_kind`, `component_id`, `operation` |
+| `drasi.plugin.errors` | counter | `plugin_kind`, `component_kind`, `component_id`, `operation`, `error_kind` |
+
+`operation` is the trait method — `start`, `stop`, `subscribe`, `enqueue_query_result`,
+`get_credentials`, `get_secret`, `bootstrap`, `get`, `set`, `delete`, `append`, `read_from`. Four
+metrics describe every plugin in the process, so one dashboard panel and one alert rule cover all
+of them regardless of kind.
+
+Three properties make the builder the right place for this:
+
+- **It is the only path that reaches index, state-store and WAL plugins at all**, since those never
+  cross FFI and so have no other channel.
+- **It is identical for static and dynamic plugins.** The decorator sits above the
+  static-vs-`SourceProxy` distinction, so there is one implementation rather than two.
+- **Attribution is complete.** The builder knows the component id and kind, so every tier 1 metric
+  is fully labelled — including for the three kinds that have no `FfiRuntimeContext`.
+
+> **Do not put this decorator in `drasi-host-sdk`.** Wrapping the FFI proxies there would instrument
+> dynamic plugins only — and **index, state-store and WAL plugins have no FFI path at all**
+> (`lib`-only crates, no `export_plugin!`), so they would silently report nothing, permanently. That
+> reason does not expire with the move to dynamic-only plugins the way "most components ship
+> statically today" would.
+
+#### 8.4 Tier 2 — the per-kind standard set
+
+Tier 1 is deliberately semantic-free: it knows a call happened, not what it meant. Tier 2 adds the
+metrics that are meaningful for a specific kind, so that every source reports the same things as
+every other source and a Postgres source can be compared against a Kafka one.
+
+**2a — derivable at the boundary.** drasi-lib computes these from the call it is already wrapping,
+so they are automatic and every implementation of that kind reports them identically:
+
+| Kind | Tier 2a metrics |
+|---|---|
+| Source | `drasi.source.subscriptions`, `drasi.source.active_subscriptions` |
+| Reaction | `drasi.reaction.results_processed`, `drasi.reaction.bootstraps` |
+| Bootstrap provider | `drasi.bootstrap.runs`, `drasi.bootstrap.duration_seconds`, `drasi.bootstrap.elements_streamed` |
+| Identity provider | `drasi.identity.credential_requests`, `drasi.identity.request_duration_seconds` |
+| Secret store | `drasi.secret_store.requests`, `drasi.secret_store.request_duration_seconds` |
+| Index backend | `drasi.index.operations`, `drasi.index.operation_duration_seconds` |
+| State store | `drasi.state_store.operations`, `drasi.state_store.operation_duration_seconds` |
+| WAL provider | `drasi.wal.appends`, `drasi.wal.append_duration_seconds` |
+
+The last three rows are exactly the **interaction metrics** that
+[§6.2](#62-storage-backend-statistics) argues only Drasi can produce, and
+[A.10](#a10-storage-index-state-store-and-wal) catalogues. They are not a separate mechanism —
+storage backends are plugins, and the decorator is where their interaction metrics come from.
+
+**2b — requires plugin cooperation.** Some per-kind metrics are standard in name and meaning but
+cannot be observed from outside: whether a connection is currently alive, how far behind an
+upstream log the plugin is, how large a batch it just fetched. drasi-lib **declares** these as part
+of the kind's contract and the SDK provides the pre-named handles, but only the plugin can supply
+values:
+
+| Kind | Tier 2b metrics |
+|---|---|
+| Source | `drasi.source.connected`, `drasi.source.reconnects`, `drasi.source.batch_size`, `drasi.source.upstream_lag_seconds`, `drasi.source.replication_lag` |
+| Reaction | `drasi.reaction.connected`, `drasi.reaction.delivery_duration_seconds`, `drasi.reaction.delivery_attempts`, `drasi.reaction.batch_size` |
+
+A plugin that does not populate them simply has no series for them, which is distinguishable from
+a value of zero. The 2a/2b split matters because it determines what an operator may *rely* on: 2a
+is guaranteed for every plugin of that kind, 2b is best-effort per implementation.
+
+The SDK exposes tier 2b as a per-kind struct of pre-registered handles — `SourceMetrics`,
+`ReactionMetrics` — so the author fills in values rather than inventing names.
+
+#### 8.5 Tier 3 — plugin-author metrics
+
+Anything else the author wants to measure about their own internals — WAL parse time, change-feed
+decoding, retry loops, cache hits. The author uses the standard `metrics` macros and the SDK routes
+them to the same recorder as tiers 1 and 2.
+
+#### 8.6 How tiers 2b and 3 reach the recorder
+
+Tiers 1 and 2a are emitted by drasi-lib itself, so they need no transport. Tiers 2b and 3 originate
+*inside* the plugin, and for a cdylib plugin that means crossing FFI.
+
+The transport is **library-scoped, not component-scoped** — and this is the part that makes the
+guarantee hold for every kind. `FfiPluginRegistration` already carries library-wide setters that
+the host calls once per loaded `.so`:
+
+```rust
+pub struct FfiPluginRegistration {
+    // …
+    pub set_log_callback:
+        extern "C" fn(ctx: *mut c_void, callback: LogCallbackFn),
+    pub set_lifecycle_callback: extern "C" fn(ctx: *mut c_void, callback: LifecycleCallbackFn),
+    pub set_config_resolver: extern "C" fn(ctx: *mut c_void, callback: ConfigResolverFn),
+    pub set_log_level: extern "C" fn(level: FfiLogLevelFilter),
+}
+```
+
+`set_log_callback` stores the callback and context in plugin-global atomics and installs the
+plugin's `tracing` subscriber. Because that state is library-global rather than per-component,
+**logging already reaches every plugin kind in the cdylib** — an identity provider's
+`tracing::warn!()` is forwarded today even though it never sees an `FfiRuntimeContext`. Metrics get
+the same treatment:
+
+```rust
+    /// Appended for SDK <next-minor>. Host installs an FFI-backed recorder as the
+    /// plugin library's global `metrics` recorder.
+    pub set_metrics_recorder:
+        extern "C" fn(ctx: *mut c_void, callback: MetricsCallbackFn),
+```
+
+The plugin SDK's handler installs an `FfiMetricsRecorder` as the cdylib's global `metrics`
+recorder, so `metrics::counter!()` anywhere in the plugin — in any plugin kind — is forwarded to
+the host. This is why plugin metrics do **not** flow through the recorder stack an embedder
+installs in the host: the plugin links its own copy of the `metrics` crate and has its own global
+slot (§2).
+
+Had this been hung off `FfiRuntimeContext` instead — the natural-looking place, since the
+per-component log callback lives there — tiers 2b and 3 would have been available to sources and
+reactions only.
+
+**ABI rule.** New fields append to the end of `FfiPluginRegistration` and the host gates access on
+the plugin's reported `sdk_version`, exactly as `identity_provider_plugins` and `set_log_level`
+already do — reading a trailing field from a plugin that allocated the older, smaller struct is
+undefined behaviour. `validate_plugin_metadata` additionally requires an exact `major.minor` match,
+so an SDK-version bump rejects stale plugins outright.
+
+#### 8.7 Attribution: what plugin-emitted metrics cannot label
+
+`FfiLogEntry` carries `instance_id` and `component_id`, but they are populated *from
+`FfiRuntimeContext` during `initialize`* and are documented as "empty if not yet initialized". For
+bootstrap, identity and secret-store plugins that is permanent, because those kinds never receive
+a context. The same limit applies to metrics.
+
+| Metric source | `plugin_kind` | `component_id` |
+|---|---|---|
+| Tier 1 / 2a — emitted by drasi-lib, any kind | yes | **yes** |
+| Tier 2b / 3 — emitted by a source or reaction | yes | yes |
+| Tier 2b / 3 — emitted by a bootstrap / identity / secret-store plugin | yes | **no** |
+
+This is acceptable rather than ideal: the affected kinds are typically configured once per
+deployment, and tiers 1 and 2a supply the fully-labelled view for every call into them. Closing the
+gap properly means adding an `initialize_fn` to those three vtables, which is a per-kind ABI change
+and is deferred.
+
+#### 8.8 Namespace governance
+
+Tier 3 is open-ended, so it is the one place a third-party plugin could collide with a Drasi metric
+name or squat on `drasi.source.*`. Two rules:
+
+- **The SDK issues pre-labelled handles.** A plugin obtains its tier 2b and tier 3 handles from an
+  SDK-provided emitter that has already captured the plugin kind and (where available) the
+  component id. This solves naming and attribution together, and is why a plugin author does not
+  hand-write labels.
+- **The bridge enforces the prefix.** `FfiMetricsRecorder` prefixes anything a plugin emits that is
+  not a declared tier 2b name, so tier 3 metrics land under `drasi.plugin.<plugin_kind>.*` and
+  cannot shadow a first-party name.
+
+> **DECIDED — the bridge is the enforcement point, and it is on every path that can carry a
+> third-party plugin.** Prefix enforcement lives in `FfiMetricsRecorder` and therefore applies to
+> cdylib plugins only. That is sufficient because sources, reactions, bootstrappers, identity
+> providers and secret stores are moving to **dynamic-only**, so the bridge is unavoidable for them.
+>
+> ⚠️ **Indexes, state stores and WALs are the permanent exception** — they declare no `cdylib`
+> crate-type and no `export_plugin!`, so they have no FFI path for a bridge to occupy. Their tier 1
+> metrics are still fully attributed, because those come from the drasi-lib decorator above rather
+> than from the plugin itself; only a tier 3 metric such a plugin emits for itself is ungoverned.
+> Acceptable while those remain first-party (Garnet, RocksDB, redb). See
+> [Open Issue 3](#open-issues) for the reopening condition.
+
+> **Consequence for naming.** The convention `drasi.<component_type>.<plugin_kind>.<metric>`
+> assumes a pipeline component type, which identity providers and secret stores do not have. Tier 1
+> therefore uses a single `drasi.plugin.*` family with `plugin_kind` and `component_kind` as
+> **labels**, consistent with the `drasi.queue.*` decision in §4.3; tier 2 uses a per-kind prefix
+> (`drasi.source.*`, `drasi.bootstrap.*`, …).
+
+#### 8.9 Enablement
+
+Emission is always optional for the plugin author — a plugin that instruments nothing is valid, and
+tiers 1 and 2a still report it. `set_log_level` is the precedent for host-controlled filtering: the
+host reports its effective level and the plugin drops records *before formatting or forwarding
+them*. A metrics equivalent should follow, so that a disabled metric costs a filter check inside
+the plugin rather than an FFI crossing.
+
+#### 8.10 Worked example: adding metrics to a source plugin
+
+Suppose someone is writing a source that subscribes to a remote change feed and reacts to frames as
+the upstream system pushes them. Before they write a single line of instrumentation they already
+get tier 1 and tier 2a, because drasi-lib emits those from the decorator wrapping their plugin.
+What follows is only what they add on top.
+
+**Step 1 — declare the handles.** Both tier 2b and tier 3 handles are registered once and cached on
+the struct, never created per event. This matters: the `metrics` macros build the metric `Key`
+*before* consulting the recorder, so a per-event `counter!("…", "source_id" => id)` allocates on
+every event even when nothing is collecting.
+
+```rust
+use drasi_plugin_sdk::prelude::*;
+use drasi_plugin_sdk::metrics::SourceMetrics;
+use metrics::{Counter, Histogram};
+
+struct ChangeFeedMetrics {
+    /// Tier 2b — names and labels come from the SDK, values from us.
+    std: SourceMetrics,
+    /// Tier 3 — specific to this plugin.
+    frames_received: Counter,
+    decode_duration_seconds: Histogram,
+    heartbeats: Counter,
+}
+```
+
+**Step 2 — obtain them from the runtime context.** `context.metrics()` returns an emitter that has
+already captured `plugin_kind` and `component_id`, so the author never writes a label. This is also
+what keeps tier 3 names inside the plugin's own namespace.
+
+```rust
+async fn initialize(&self, context: SourceRuntimeContext) {
+    let m = context.metrics();
+    let _ = self.metrics.set(ChangeFeedMetrics {
+        std:                     m.source(),                    // drasi.source.*
+        frames_received:         m.counter("frames_received"),  // drasi.plugin.changefeed.frames_received
+        decode_duration_seconds: m.histogram("decode_duration_seconds"),
+        heartbeats:              m.counter("heartbeats"),
+    });
+}
+```
+
+**Step 3 — record.** Tier 2b is populated exactly like tier 3; the only difference is that its names
+are part of the source contract, so a dashboard built for one source works for this one too.
+
+```rust
+async fn start(&self) -> Result<()> {
+    let m = self.metrics.get().expect("initialize runs first");
+    let mut stream = self.subscribe_upstream().await?;
+    m.std.connected.set(1.0);                            // tier 2b — declared by drasi-lib
+
+    while let Some(frame) = stream.next().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(e) => {
+                m.std.connected.set(0.0);
+                // No error counter here: tier 1 already counts this call's failure.
+                tracing::warn!(error = %e, "upstream stream interrupted");
+                stream = self.resubscribe().await?;
+                m.std.reconnects.increment(1);           // tier 2b
+                m.std.connected.set(1.0);
+                continue;
+            }
+        };
+
+        m.frames_received.increment(1);                  // tier 3 — ours
+        m.std.upstream_lag_seconds.set(frame.age().as_secs_f64());   // tier 2b
+
+        let started = Instant::now();
+        let changes = self.decode(frame)?;
+        m.decode_duration_seconds.record(started.elapsed().as_secs_f64());
+        m.std.batch_size.record(changes.len() as f64);   // tier 2b
+
+        for change in changes {
+            self.dispatch_change(change).await?;
+        }
+    }
+    Ok(())
+}
+```
+
+Three things worth noting about what the author did *not* write:
+
+- **No labels.** `source_id` / `plugin_kind` are attached by the emitter, so they cannot be
+  forgotten, misspelled, or made unbounded.
+- **No error counter for the interrupted stream.** The tier 1 decorator already recorded
+  `drasi.plugin.errors{operation="start"}` if the call returns `Err`. A plugin should add an error
+  counter only for failures it *handles internally* and never surfaces to the host — which is
+  exactly the case above, where the loop resubscribes and continues.
+- **No exporter, no recorder, no configuration.** Whether these land in Prometheus or OTLP, and
+  whether this plugin is statically linked or loaded from a `.so`, is decided by the host.
+
+**For plugin kinds with no runtime context** — bootstrap, identity, secret store — there is no
+`context.metrics()`, so the SDK exposes a library-scoped emitter instead. It carries `plugin_kind`
+but not `component_id`, per §8.7:
+
+```rust
+let m = drasi_plugin_sdk::metrics::plugin_metrics();  // no component_id available
+let cache_hits = m.counter("cache_hits");             // drasi.plugin.vault.cache_hits
+```
+
+**The raw macros still work.** `metrics::counter!("anything")` reaches the same recorder — the
+emitter is a convenience and a governance mechanism, not a gate.
+
+### 9. Naming and Namespacing Conventions
+
+**DECIDED — dot-namespaced, lowercase, with the unit and the counter suffix written into the leaf.
+Service identity lives in a resource attribute, never in the metric name.**
+
+The two conventions worth following disagree with each other, so the choice turns on one
+implementation fact about our stack rather than on taste.
+
+#### 9.1 What the established conventions actually say
+
+| Rule | OpenTelemetry semconv | Prometheus |
+|---|---|---|
+| Separator | dot for namespaces, `snake_case` within a component (`http.response.status_code`) | `_` throughout |
+| Prefix | namespace required; app developers use their application name | single-word application prefix (`prometheus_`, `process_`) |
+| Unit in the name | **No** — units live in instrument metadata | **Yes** — required suffix, plural (`_seconds`, `_bytes`) |
+| Base unit | seconds for durations | seconds for durations; never ms/ns |
+| Counter suffix | **Never `_total`** — "confusing in delta backends" | **`_total`** for accumulating counts |
+| Pluralization | namespaces never; names only for countable instances (`system.disk.operations`) | not prescribed |
+| Duration naming | `{operation}.duration` | `{thing}_duration_seconds` |
+
+They agree on more than they disagree: lowercase, an application prefix, base units, no label names
+baked into metric names, and that `sum()`/`avg()` across a metric's labels should be meaningful.
+They disagree on exactly two points — **unit in the name, and `_total`** — and Prometheus states its
+reasoning explicitly: type and unit information is needed when reading PromQL in plain YAML
+(alerting and recording rules), and omitting units causes collisions such as `process_cpu` meaning
+seconds in one place and milliseconds in another.
+
+#### 9.2 The fact that decides it
+
+Under the OpenTelemetry SDK the disagreement is a non-issue: you write the OTel name, set the unit
+in metadata, and the Prometheus exporter mechanically produces the Prometheus name — replacing `.`
+with `_`, appending the unit word, and appending `_total` to monotonic sums. Both conventions are
+satisfied because the exporter translates between them.
+
+**Drasi does not emit through the OpenTelemetry SDK.** It emits through the `metrics` facade (§2),
+and `metrics-exporter-prometheus` performs *no* such translation. Its documented name handling is
+limited to replacing invalid characters with `_`; its `formatting` module offers only
+`sanitize_metric_name`, `write_help_line`, `write_type_line` and `write_metric_line`. There is no
+unit suffixing and no `_total` appending. `metrics::Unit` exists and `describe_histogram!` records
+it, but the Prometheus exporter does not use it to build the name.
+
+So **the name we write is, after `.` → `_` substitution, the name that ships**. Nothing downstream
+will add what we leave out. If we follow OTel's "no unit in the name" rule, Prometheus receives
+`drasi_query_engine_duration` — no unit, no type — which is precisely the ambiguity Prometheus
+warns about, and the `Unit::Seconds` we carefully declared is silently discarded.
+
+#### 9.3 The convention
+
+1. **Lowercase, dot-separated namespaces, `snake_case` within each component.** This is OTel's
+   general naming rule and it survives sanitization intact: `drasi.query.engine_duration_seconds`
+   renders as `drasi_query_engine_duration_seconds`.
+2. **`drasi` is the root namespace** for everything Drasi emits.
+3. **Durations use seconds, as `f64`** — never `_ms` or `_ns`. Both conventions require base units.
+   Sub-microsecond values are represented exactly by `f64` seconds, so no precision is lost.
+4. **The unit is part of the leaf**, plural: `_seconds`, `_bytes`, `_ratio`. Unitless counts of
+   discrete things (`drops`, `errors`, `frames`) take no unit suffix — Prometheus explicitly
+   excludes countable things from this rule.
+5. **Monotonic counters end in `_total`.** Gauges, histograms and UpDownCounters never do.
+6. **Pluralize only counts of discrete instances.** `drasi.queue.drops_total` yes;
+   `drasi.queue.depth` no. Namespaces are never pluralized.
+7. **Also call `describe_*`** with a `Unit` and a description. It populates `# HELP`/`# TYPE`, and
+   it keeps the metadata correct for an OTLP branch even though Prometheus ignores the unit.
+8. **Labels never appear in names.** `drasi.source.events_total{source_id="x"}`, never
+   `drasi.source.x.events_total`.
+9. **`sum()` or `avg()` across a metric's labels must be meaningful.** This is the test that
+   justifies one `drasi.queue.*` family labelled by `component_kind` rather than a family per
+   component type.
+
+> **This is a deliberate divergence from OTel semconv on rules 4 and 5**, and it is reversible.
+> It is correct *because* our exporter is a passthrough. If Drasi ever emits through the OTel SDK,
+> the suffixes must be removed at the same time — otherwise the SDK's exporter appends its own and
+> produces `..._seconds_seconds` and `..._total_total`.
+
+#### 9.4 Namespace layout
+
+| Namespace | Owner |
+|---|---|
+| `drasi.source.*`, `drasi.query.*`, `drasi.reaction.*` | pipeline stages |
+| `drasi.pipeline.*` | metrics spanning the whole pipeline |
+| `drasi.queue.*` | backpressure, labelled by `component_kind` |
+| `drasi.component.*` | lifecycle, any component type |
+| `drasi.plugin.*` | the universal plugin baseline (tier 1, §8.3) |
+| `drasi.plugin.<plugin_kind>.*` | plugin-author metrics (tier 3), prefix enforced by the bridge |
+| `drasi.index.*`, `drasi.state_store.*`, `drasi.wal.*` | storage interaction |
+| `drasi.index.rocksdb.*` | engine-native stats, kept engine-specific by design |
+| `process_*` | **exception** — ecosystem-standard, no `drasi` prefix |
+
+Engine-specific statistics keep an engine-specific namespace rather than being forced into a shared
+name, following OTel's own reasoning for preferring `jvm.gc.*` over `gc.*`: implementations differ
+enough that a shared name invites false comparison.
+
+#### 9.5 Service identity is a resource attribute, not a prefix
+
+**`drasi-lib` and `drasi-server` are NOT differentiated in the metric name.** They are distinguished
+by the OTel `service.name` resource attribute, or an equivalent global label on the Prometheus
+exporter — which is what those mechanisms exist for.
+
+**Specifically, there is no `drasi.lib.*` namespace.** That was considered and rejected: it names
+metrics by *the crate that compiled them* rather than by *what they measure*, and both variants fail
+differently.
+
+| Variant | What breaks |
+|---|---|
+| Flat `drasi.lib.*` | Pipeline latency, checkpoint/reliability and component lifecycle all collapse into one namespace, losing the grouping that makes the set browsable |
+| Per-module `drasi.lib.<module>.*` | The opposite failure: intervals A–G are **one ordered flow** that an operator reads as a single row, but they would scatter across `drasi.lib.sources.*`, `.channels.*` and `.queries.*` |
+
+The domain layout above avoids both — `drasi.pipeline.*` keeps the end-to-end flow together while
+`drasi.source.*` / `drasi.query.*` / `drasi.reaction.*` group by stage.
+
+**Two further reasons, and the second is the decisive one:**
+
+1. **Comparability.** `drasi.query.events_processed_total` should mean the same thing, and be
+   chartable on the same panel, whether the query ran inside Drasi Server or a user's own binary.
+   Encoding the host in the name makes that impossible and doubles the number of names for no gain.
+2. **"lib" is only ever a crate.** `drasi.server.*` is legitimate because *server* is a **functional
+   domain** as well as a crate — API traffic, config persistence and uptime are things only a server
+   has, and they have no pipeline equivalent. There is no corresponding domain called "lib": the
+   library *is* the pipeline, and the pipeline already has proper domain namespaces. The name would
+   also be meaningless to an embedder reaching Drasi through a non-Rust binding, for whom no crate
+   called `drasi-lib` is a visible concept.
+
+If lib-vs-server provenance is genuinely wanted, it belongs in a label or the OTel instrumentation
+scope — not in the name. **Spans follow a different convention**, deliberately; see
+[01 — Tracing](01-tracing.md#span-naming-and-namespacing).
+
+#### 9.6 Consequences
+
+This supersedes the `_ns` convention inventoried in §3.7. The existing `ProfilingMetadata` fields
+stay in nanoseconds internally — only the *exported* metric converts, via `as_secs_f64()`. Note it
+settles the **unit** only: bucket *boundaries* remain the embedder's, since they are recorder
+configuration that [Requirement 1](00-observability-overview.md#requirements) puts out of
+drasi-lib's reach — see [Open Issue 2](#open-issues), including why the Prometheus defaults are the
+wrong shape for Drasi's intervals.
+
 ### Alternatives Considered
 
 #### 1. Embed Metrics in ComponentLogLayer
@@ -752,7 +1451,7 @@ Extend the existing `ComponentLogLayer` to also track counters and histograms in
 
 **Rejected because**: `ComponentLogLayer` is a log routing mechanism, not a metrics system. The `metrics` crate provides the standard Rust interface for counters/histograms/gauges with ecosystem support for exporters. Mixing concerns in `ComponentLogLayer` would make it harder to maintain.
 
-See also [00 — Overview](00-observability-overview.md#alternatives-considered) for the facade-vs-OpenTelemetry-SDK decision, which applies to metrics as well as tracing.
+See also [00 — Overview](00-observability-overview.md#requirements) — Requirement 1's facade-only rule is what rejects instrumenting against the OpenTelemetry SDK directly, and it applies to metrics as well as tracing.
 
 #### 2. Exporter-Only ("Option A")
 
@@ -787,6 +1486,13 @@ adopts — which is why the outcome is neither A nor B.
 | Queue promotion fidelity | Unit | With `DebuggingRecorder`, drive a `PriorityQueue` to capacity; assert `drasi.queue.depth`, `drasi.queue.depth_max`, `drasi.queue.drops_total` and `drasi.queue.blocked_enqueues_total` match the existing `PriorityQueueMetrics::snapshot()` values exactly. The promoted metric and the existing struct must never disagree |
 | Latency histograms from profiling stamps | Unit | Push events through a mock pipeline; assert `drasi.query.engine_duration_seconds` and `drasi.pipeline.end_to_end_duration_seconds` record non-zero samples derived from the stamped `ProfilingMetadata` timestamps |
 | Monotonic clock | Unit | Step the wall clock backwards mid-run; assert no histogram records a negative-turned-huge value (§5.6) |
+| No `SystemTime` subtraction | Unit / lint | Assert every interval A–G is computed from an `Instant` pair. A grep-level check that no duration is derived by subtracting two `_ns` wall-clock fields is enough to pin the §5.6 rule |
+| Histogram single-drainer | Unit | Record samples, then read the published snapshot twice and from two independent consumers; assert both reads return identical data and that no consumer's read empties the bucket. Assert `clear_with()` has exactly one call site (§2.5) |
+| `phase` separation | Unit | Push bootstrap and steady-state events through the same query; assert `drasi.pipeline.end_to_end_duration_seconds` produces two distinct label sets and that the bootstrap samples do not appear in the steady-state distribution (§4.1) |
+| `end_to_end` label set | Unit | Assert `drasi.pipeline.end_to_end_duration_seconds` carries only `query_id` and `phase` — no `source_id`, no `reaction_id`. This pins the §5.4 cardinality decision against a well-meaning future addition |
+| `ProfilingConfig` removed | Compile | Assert `ProfilingConfig` and `should_profile()` no longer exist and that stamping remains unconditional (§5.6) |
+| redb `stats()` is never called on a timer | Unit / lint | Assert `WriteTransaction::stats()` has no call site in any sampling or export path. It takes the single write lock and scans every page, so a periodic caller would inject latency into the WAL write path |
+| RocksDB properties need no `enable_statistics()` | Unit | Open a RocksDB index *without* calling `enable_statistics()`; assert `total-sst-files-size`, `cur-size-all-mem-tables`, `estimate-pending-compaction-bytes` and `actual-delayed-write-rate` all return values via `property_int_value` |
 | No sampling | Unit | Drive N events through the pipeline; assert every counter reports exactly N. Counters must never be approximate (§5.1) |
 | Inspection API unchanged | Integration | `get_query_output_metrics` / `get_reaction_metrics` / `get_lifecycle_metrics` return identical values before and after the facade is added (§3.6 says emit alongside, not replace) |
 | Label cardinality | Unit | Assert `error_kind` values come from a closed enum; fail the test if a formatted string reaches a label |
@@ -794,12 +1500,20 @@ adopts — which is why the outcome is neither A nor B.
 
 ## Open Issues
 
-1. **Opting out of per-component labels**: §5.4 sizes Phase 0 at roughly 1,200 series for a mid-sized deployment and fixes the one multiplicative metric, so cardinality is bounded in the cases we expect. What is *not* settled is the escape hatch: at very large component counts, should drasi-lib offer a configuration that drops `query_id` / `source_id` / `reaction_id` from the label set and reports only aggregates? Doing so makes the metrics cheap but useless for per-component diagnosis, so it needs a deliberate default. This interacts with the filtering and profile model in [00 — Overview](00-observability-overview.md).
-2. **Histogram bucket boundaries**: the naming convention settles the *unit* — duration histograms record **seconds** as `f64` — but not the bucket boundaries themselves, which the `metrics` crate leaves to the recorder. Drasi's pipeline intervals span roughly a microsecond to a few seconds, so the default Prometheus buckets (5ms–10s) resolve almost nothing at the fast end. Should drasi-lib publish a recommended bucket set for `drasi.query.engine_duration_seconds` and `drasi.pipeline.end_to_end_duration_seconds`, or leave it entirely to the embedder? `PrometheusBuilder` supports per-metric overrides via `Matcher`, so a recommendation costs the embedder one builder call.
+1. ~~**Opting out of per-component labels**~~ — **RESOLVED: no escape hatch, until someone needs one.** §5.4 sizes Phase 0 at roughly 1,700 series for a mid-sized deployment and fixes the one multiplicative metric. Scaling that example twentyfold — 50 sources, 500 queries, 100 reactions — lands near 31,000 series, which a single Prometheus absorbs without noticing; the threshold where this would genuinely bite is in the thousands of queries per process. Adding a switch that drops `query_id` / `source_id` / `reaction_id` would trade away the whole diagnostic point of the metrics ("some query is slow" instead of "`orders-join` is slow") to solve a problem no known deployment has. **Reopen if a concrete deployment hits it**, with its component counts, rather than designing the hatch speculatively.
+2. ~~**Histogram bucket boundaries**~~ — **RESOLVED: the embedder owns them, and drasi-lib publishes no recommended set.** Buckets are *recorder* configuration, and [Requirement 1](00-observability-overview.md#requirements) forbids drasi-lib from installing or configuring a recorder — so this is not a preference, it is the only option consistent with facade-only. `PrometheusBuilder` supports per-metric overrides via `Matcher`, so an embedder wanting different boundaries has one builder call to make.
+   > ⚠️ **The default buckets are wrong for Drasi, and this document must say so even though it recommends none.** Prometheus defaults start at **5ms**, while `drasi.query.engine_duration_seconds` measures work in the **microsecond** range. Under the defaults essentially every sample lands in the first bucket and every percentile reads "under 5ms" — true, and useless: a 10µs query and a 4ms query become indistinguishable, a 400× difference. Declining to *publish* a bucket set is not the same as declining to *warn*.
+   >
+   > This also makes the designated-drainer decision (§2) matter more than it first appeared: keeping raw samples means an embedder who chose badly can re-bucket later, where a quantile sketch would have baked the mistake in permanently.
 
-3. **Plugin metrics naming governance**: settled in principle — tier 1 uses `drasi.plugin.*`, tier 2 a per-kind prefix, and tier 3 is prefixed to `drasi.plugin.<plugin_kind>.*` by `FfiMetricsRecorder` ([00 — Overview](00-observability-overview.md#namespace-governance)). **What remains open is enforcement for statically linked plugins**, which bypass the bridge entirely and so reach the global recorder with whatever name they choose. Either the SDK emitter becomes the only supported emission path, or static plugins are governed by convention alone.
+3. ~~**Plugin metrics naming governance**~~ — **RESOLVED for the kinds that can be dynamic; a narrow, permanent gap remains elsewhere.** Tier 1 uses `drasi.plugin.*`, tier 2 a per-kind prefix, and tier 3 is prefixed to `drasi.plugin.<plugin_kind>.*` by `FfiMetricsRecorder` ([§8.8](#88-namespace-governance)). Since the plugin model is moving to **dynamic-only** for sources, reactions, bootstrappers, identity providers and secret stores, the bridge is on every emission path for those kinds and prefix enforcement is a real guarantee rather than a convention.
+   > ⚠️ **Three plugin kinds cannot go dynamic, and this is structural rather than a roadmap item.** `components/indexes/*`, `components/state_stores/*` and `components/wals/*` declare **no `cdylib` crate-type and contain no `export_plugin!`** — they are `lib`-only and have no FFI path at all, so no bridge can sit in front of them. Their **tier 1** metrics are unaffected, because those come from drasi-lib's own decorator, which sits above the FFI distinction and is fully attributed ([§8.8](#88-namespace-governance)). What stays ungoverned is a **tier 3** metric such a plugin emits for itself.
+   >
+   > That is acceptable **only while those plugins are first-party** — today they are Garnet, RocksDB and redb ×2. The risk B5 was about is a *third-party* plugin squatting a Drasi name, and no third-party index, state store or WAL can exist without this being revisited. **Reopen the moment one does.**
+   >
+   > The span-side fix from [01 — Tracing](01-tracing.md#build-mode-identity-converges-scope-does-not) does not transfer and cannot be used here: spans nest, so a host span lends `plugin_kind` to anything emitted inside it, but a metric emission has no enclosing scope to inherit from.
 
-4. **Two stores for the same numbers**: §3.6 keeps the existing `lib/src/metrics/` atomic structs for the synchronous inspection API while also emitting through the facade into the registry (§2). That is deliberate for Phase 0 — it keeps the inspection API bit-for-bit unchanged — but it means two sources of truth that can drift. Should a later phase back `get_query_output_metrics()` and friends with the registry and delete the bespoke structs? Doing so would remove the duplication but changes the inspection API's failure modes and timing.
+4. ~~**Two stores for the same numbers**~~ — **DEFERRED, deliberately.** §3.6 keeps the existing `lib/src/metrics/` atomic structs for the synchronous inspection API while also emitting through the facade into the registry (§2). That is the Phase 0 decision and it stands: it keeps the inspection API bit-for-bit unchanged at the moment of highest churn. Collapsing onto the registry later would remove the duplication but would change the inspection API's **failure modes and timing** — registry reads behave differently from an atomic load, and histograms become subject to the drainer snapshot (§2). Not a Phase 0 question, and not worth pre-deciding: **revisit when the inspection API is next touched for its own reasons.** The drift this risks is already guarded by the queue-promotion fidelity test, which asserts the promoted metric and the existing struct never disagree.
 
 ## Appendix A — Future Metrics (P1–P3)
 
@@ -1001,6 +1715,14 @@ Nothing is collected today, and the RocksDB `Statistics` API is never enabled (�
 | `drasi.wal.append_duration_seconds` | histogram | `wal_kind` | WAL append latency | new | P2 |
 | `drasi.wal.size_bytes` | gauge | `wal_kind` | WAL size | new | P2 |
 | `drasi.index.rocksdb.*` | mixed | `query_id` | Engine-native stats (block cache hit ratio, compaction, level sizes, memtable) — opt-in, embedded engines only | new | P3 |
+
+> **Survey outcome**, from [Exposing embedded-engine statistics](#exposing-embedded-engine-statistics).
+> The RocksDB rows are cheaper than assumed: four of the five curated statistics come from
+> `property_int_value` and need no `enable_statistics()`, so they need no opt-in flag either — only
+> block cache hit ratio is blocked, on the pinned `rocksdb 0.21`. The redb side is the opposite —
+> **no engine-native redb metrics are collected at all**, because `stats()` requires the single
+> write lock and scans every page. `drasi.wal.size_bytes` therefore comes from the filesystem, and
+> the `*_duration_seconds` rows are Drasi's own timings rather than anything redb reports.
 
 §6.2 settles the ownership question these depend on: **interaction metrics** (the `drasi.index.*`,
 `drasi.state_store.*` and `drasi.wal.*` rows above) always flow through Drasi for every backend,
