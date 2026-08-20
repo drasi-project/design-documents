@@ -432,7 +432,7 @@ structure for events whose traces are gone.
 
 - **`query.process` duration already includes the index lookups**, so a slow join shows up as a slow
   `query.process`. Attributing it to the index specifically is a metrics question —
-  `drasi.index.operation_duration_seconds` labelled by `query_id`
+  `drasi.index.operation.duration` labelled by `query_id`
   ([02 — Metrics A.10](02-metrics.md#a10-storage-index-state-store-and-wal)) — not a trace one.
 - **Bootstrap is the one time both sources appear in a single trace.** The bootstrap tree roots at
   `query.bootstrap.supervise` with `source.bootstrap` and `query.bootstrap` *per source* beneath it,

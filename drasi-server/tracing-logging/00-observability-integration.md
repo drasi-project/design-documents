@@ -292,13 +292,13 @@ The same applies to CPU: `cpu.max` quota, not host core count, determines thrott
 
 When the files are present, Drasi Server reads them directly and emits:
 
-| Metric | Source (cgroup v2) | Meaning |
-|---|---|---|
-| `drasi.server.cgroup.memory_limit_bytes` | `memory.max` | Hard limit; **absent** when the file reads `max` (unlimited) |
-| `drasi.server.cgroup.memory_current_bytes` | `memory.current` | What the kernel actually counts against the limit |
-| `drasi.server.cgroup.memory_utilization_ratio` | derived | `current / limit` — the headroom signal, and the thing to alert on |
-| `drasi.server.cgroup.cpu_quota_cores` | `cpu.max` (quota ÷ period) | Effective core allowance; **absent** when quota reads `max` |
-| `drasi.server.cgroup.cpu_throttled_seconds_total` | `cpu.stat` `throttled_usec` | Time spent throttled — evidence the quota is binding |
+| Metric | Unit | Source (cgroup v2) | Meaning |
+|---|---|---|---|
+| `drasi.server.cgroup.memory.limit` | `By` | `memory.max` | Hard limit; **absent** when the file reads `max` (unlimited) |
+| `drasi.server.cgroup.memory.current` | `By` | `memory.current` | What the kernel actually counts against the limit |
+| `drasi.server.cgroup.memory.utilization` | `1` | derived | `current / limit` — the headroom signal, and the thing to alert on |
+| `drasi.server.cgroup.cpu.quota` | `{core}` | `cpu.max` (quota ÷ period) | Effective core allowance; **absent** when quota reads `max` |
+| `drasi.server.cgroup.cpu.throttled` | `s` | `cpu.stat` `throttled_usec` | Monotonic time spent throttled — evidence the quota is binding |
 
 > **Naming decision.** These are deliberately **not** `container_*` and **not** `process_*`.
 > `container_*` is cAdvisor's namespace, populated from *outside* the container with different labels
@@ -541,7 +541,7 @@ text, and spans arrive at a mock OTLP receiver.
 
 ### Future Consideration: Server-Level Metrics
 
-Beyond drasi-lib's pipeline metrics (source events, query processing, reaction delivery) and the process resource metrics added by this design (`process_*` from `metrics-process`), a future iteration could add Drasi Server's own *application-level* operational metrics for remote monitoring and management — e.g., `drasi.server.uptime_seconds`, `drasi.server.sources_total` (by status), `drasi.server.api_requests_total`, `drasi.server.api_request_duration_seconds`, `drasi.server.config_saves_total`. These are distinct from process resource metrics: they describe application state and API traffic rather than OS-level resource usage. They would be recorded in Axum middleware and server lifecycle code (not in drasi-lib) and flow to whatever recorder the telemetry config installs. Names follow the [naming convention](../../drasi-lib/tracing-logging/00-observability-overview.md#naming-and-namespacing-conventions) — base units in the leaf, so durations are `_seconds` as `f64`, never `_ns`. This is not in scope for this design but is a natural next step once the telemetry infrastructure is in place.
+Beyond drasi-lib's pipeline metrics (source events, query processing, reaction delivery) and the process resource metrics added by this design (`process_*` from `metrics-process`), a future iteration could add Drasi Server's own *application-level* operational metrics for remote monitoring and management — e.g., `drasi.server.uptime` (unit `s`), `drasi.server.sources` (by status), `drasi.server.api.requests`, `drasi.server.api.request.duration` (unit `s`), and `drasi.server.config.saves`. These are distinct from process resource metrics: they describe application state and API traffic rather than OS-level resource usage. They would be recorded in Axum middleware and server lifecycle code (not in drasi-lib) and flow to whatever recorder the telemetry config installs. Names follow the [OpenTelemetry naming convention](../../drasi-lib/tracing-logging/00-observability-overview.md#naming-and-namespacing-conventions), with units and instrument type carried as metadata. This is not in scope for this design but is a natural next step once the telemetry infrastructure is in place.
 
 ## References
 

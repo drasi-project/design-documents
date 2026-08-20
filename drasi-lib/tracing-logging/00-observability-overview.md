@@ -59,7 +59,7 @@ This design adds structured tracing spans and explicit metrics to drasi-lib's pi
 1. **Facade-only**: drasi-lib MUST NOT install a `tracing::Subscriber` or `metrics::Recorder`. It only emits through the facade APIs.
 2. **Backward compatible**: Existing applications that use `log` crate macros and `ComponentLogLayer` MUST continue to work without changes. The `tracing-log` bridge already forwards `log::info!()` events to `tracing`.
 3. **Structured fields**: All spans will include identifying fields (`source_id`, `query_id`, `reaction_id`) so that traces can be filtered and correlated.
-4. **Metric naming**: All metrics use the `drasi.` root namespace and follow the scheme defined in [Naming and Namespacing Conventions](#naming-and-namespacing-conventions) — dot-separated namespaces, base units in the leaf, `_total` on monotonic counters (e.g. `drasi.query.events_processed_total`, `drasi.query.engine_duration_seconds`).
+4. **Metric naming**: All metrics follow OpenTelemetry naming conventions under the `drasi.` root namespace. Names are dot-separated; units and instrument type are metadata rather than suffixes (for example, `drasi.query.events_processed` and `drasi.query.engine.duration`).
 
 ### Out of Scope
 
@@ -165,6 +165,18 @@ Today, only flat log messages cross the FFI boundary — `FfiTracingLayer` captu
 #### Proposed Approach: Centralized Callback Bridge
 
 All three telemetry signals — logs, metrics, and traces — use the same architecture: the plugin serializes telemetry data into a flat C-compatible struct and sends it to the host via a callback function pointer on the vtable. The host receives it and routes it through its own subscriber/recorder. This gives the host full control over filtering, sampling, and export.
+
+The plugin cannot share its live telemetry objects with the host. Instead, it sends a copy of the
+relevant data:
+
+- **Logs:** The plugin sends each log entry (`FfiLogEntry`) to the host through `LogCallbackFn`.
+   The host then records it through its logging pipeline.
+- **Metrics:** The plugin sends each metric update (`FfiMetricEntry`) through `MetricsCallbackFn`.
+   The host records that update in its central metrics recorder.
+- **Traces:** The host first sends the current trace and parent IDs to the plugin in
+   `FfiTraceContext`. When a plugin span finishes, the plugin sends its name, IDs, timestamps, and
+   fields back as `FfiCompletedSpan`. The host then exports that completed span through
+   `PluginSpanSink`.
 
 In this context, the **host** is the application that loads and manages plugins — i.e., drasi-lib's manager layer (or Drasi Server wrapping it). The host runs the pipeline spans (`source.dispatch`, `query.process`, etc.) and owns the single `tracing` subscriber, `metrics` recorder, and OTLP exporter. Plugins are the cdylib shared libraries loaded into the host process — they do not have their own exporters.
 
@@ -286,7 +298,7 @@ for bootstrap, identity and secret-store plugins they are **permanently unavaila
 never receive a context. Telemetry drasi-lib emits *about* them from the builder decorator is fully
 labelled; telemetry they emit *themselves* carries `plugin_kind` but no `component_id`. Closing the
 gap means adding an `initialize_fn` to those three vtables, a per-kind ABI change, and is deferred.
-Per-signal detail in [02 — Metrics §8.7](02-metrics.md#87-attribution-what-plugin-emitted-metrics-cannot-label).
+Per-signal detail in [02 — Metrics §8.6](02-metrics.md#86-attribution-what-plugin-emitted-metrics-cannot-label).
 
 ##### Namespace governance and enablement
 
@@ -296,8 +308,8 @@ name. The SDK issues pre-labelled handles and `FfiMetricsRecorder` enforces the
 because they have no FFI path for a bridge to occupy. Emission is always optional for the plugin
 author; `set_log_level` is the precedent for host-controlled filtering, so a disabled metric should
 cost a filter check inside the plugin rather than an FFI crossing. Full reasoning and the reopening
-condition are in [02 — Metrics §8.8](02-metrics.md#88-namespace-governance) and
-[§8.9](02-metrics.md#89-enablement).
+condition are in [02 — Metrics §8.7](02-metrics.md#87-tier-3-namespace) and
+[§8.8](02-metrics.md#88-enablement).
 
 ### Plugin Developer Experience: Transparent Bridge
 
@@ -313,7 +325,7 @@ For trace context injection, the host cannot rely on task-local storage — the 
 
 > **Worked examples live with their signal.** Adding metrics to a plugin — declaring tier 2b/3
 > handles, obtaining a pre-labelled emitter, and what the author deliberately does *not* write — is
-> in [02 — Metrics §8.10](02-metrics.md#810-worked-example-adding-metrics-to-a-source-plugin).
+> in [02 — Metrics §8.9](02-metrics.md#89-worked-example-adding-metrics-to-a-source-plugin).
 > Writing spans in a plugin — why you never plumb trace context, the one case where nesting
 > silently stops (`tokio::spawn`), the four rules that keep plugin spans useful, and how to see your
 > spans without a collector — is in
@@ -491,7 +503,7 @@ crossing. See [Plugin Telemetry Across FFI](#plugin-telemetry-across-ffi).
 
 The third question in this section's original OPEN block — whether a user gets a backend's native
 metrics verbatim or a curated subset under `drasi.` — is answered in
-[02 — Metrics §6.2](02-metrics.md#62-storage-backend-statistics): **curated by default, verbatim
+[02 — Metrics §6.2](02-metrics.md#62-storage-backend-metrics): **curated by default, verbatim
 behind a flag**, backend-neutral names only where the semantics genuinely match. Profiles select
 *how much*; §6.2 decides *in what form*.
 
@@ -502,14 +514,14 @@ its own document.**
 
 | Signal | Rule, in one line | Defined in |
 |---|---|---|
-| **Metrics** | Lowercase dot-separated namespaces under a `drasi.` root, base units and the unit word in the leaf (`_seconds`, `_bytes`), `_total` on monotonic counters, labels never in the name | [02 — Metrics §9](02-metrics.md#9-naming-and-namespacing-conventions) |
+| **Metrics** | OpenTelemetry names under `drasi.`; units and instrument type are metadata, and attributes never appear in the name | [02 — Metrics §9](02-metrics.md#9-naming-and-namespacing-conventions) |
 | **Spans** | Same lowercase dotted style but **no `drasi.` prefix and no unit suffixes**; identity lives in fields, and namespacing comes from the `tracing` target and OTel instrumentation scope | [01 — Tracing](01-tracing.md#span-naming-and-namespacing) |
 
 Two points are worth stating here rather than in either document, because they are the reason the
 conventions diverge at all:
 
 1. **A metric name is a global key; a span name is not.** Two components emitting
-   `events_processed_total` collapse into one series, so metrics need a prefix and the bridge
+   `events_processed` collapse into one series, so metrics need a prefix and the bridge
    enforces one. A span already carries its own attributes, parent and trace id, so grouping happens
    at query time and a prefix would only make every name longer.
 2. **Service identity is a resource attribute, never a prefix.** `drasi-lib` and `drasi-server` are
@@ -664,16 +676,6 @@ reachable from a supported API.
 code path for creating the registry, the channel and the worker, and a second, thinner one for
 installing.
 
-> **DECIDED: `get_or_init_global_registry()` is removed, not deprecated.** Keeping it as an alias
-> would leave three functions where two suffice, and would leave the subscriber-installing behaviour
-> reachable — which is the thing being fixed. Callers migrate by replacing it with
-> `init_default_subscriber()` for identical behaviour, or with `init_component_log_layer()` if they
-> want to compose. `DrasiLib::new()` stops calling either one; installing telemetry becomes the
-> embedder's job, which is what [Requirement 1](#requirements) means in practice.
->
-> **This narrows [Requirement 2](#requirements).** Backward compatibility is preserved where it was
-> promised — `log::info!()` still reaches component log streams, `ComponentLogLayer` behaves
-> identically, and the REST log API is unchanged. It is *not* preserved for the initializer itself.
 
 #### When the log worker starts
 
@@ -787,4 +789,3 @@ Shared checks:
 - [`tracing` crate](https://crates.io/crates/tracing) — Structured diagnostics facade for Rust
 - [`metrics` crate](https://crates.io/crates/metrics) — Metrics facade for Rust
 - [OpenTelemetry semantic conventions — naming](https://opentelemetry.io/docs/specs/semconv/general/naming/) — the basis for the dotted-namespace scheme
-- [Prometheus — metric and label naming](https://prometheus.io/docs/practices/naming/) — the basis for base units and the `_total` suffix
