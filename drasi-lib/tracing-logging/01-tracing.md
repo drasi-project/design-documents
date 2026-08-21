@@ -51,8 +51,9 @@ A cdylib plugin has its own Tokio runtime and `tracing` subscriber, so it cannot
 `FfiTraceContext`, containing the trace ID, current span ID, and sampling decision.
 
 For source changes, the source plugin creates or adopts the `source.produce` context and attaches it
-to `FfiSourceEvent`; the host uses it as the parent of `source.dispatch`. Context also travels from
-the host into a plugin when the host sends a query result to a reaction, subscribes a source,
+to `FfiSourceEvent`; the host uses it as the parent of `source.dispatch`.
+
+Context also travels from the host into a plugin when the host sends a query result to a reaction, subscribes a source,
 requests a bootstrap snapshot, or calls lifecycle operations such as `start` and `stop`. The plugin
 uses the supplied context as the parent of its work. When a plugin span finishes, the plugin returns
 it as `FfiCompletedSpan` through `SpanCallbackFn`, and the host forwards it to `PluginSpanSink` for
