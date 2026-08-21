@@ -5,24 +5,10 @@
 
 ## Overview
 
-Drasi Server is a standalone single-process deployment of Drasi that embeds `drasi-lib`. Under the [drasi-lib observability design](../../drasi-lib/tracing-logging/00-observability-overview.md) — covering [tracing](../../drasi-lib/tracing-logging/01-tracing.md) and [metrics](../../drasi-lib/tracing-logging/02-metrics.md) — drasi-lib will emit structured tracing spans and `metrics` crate counters/histograms/gauges through facade APIs. This design makes Drasi Server the embedding application that collects them: it wires up the tracing subscriber and metrics recorder so drasi-lib's telemetry flows to external backends (OTLP, Prometheus, stdout).
-
-> **The three signals do not start from the same place, and the difference matters here.** Metrics are
-> genuinely no-ops until a `Recorder` is installed. Spans are *created* but exported nowhere until a
-> `tracing-opentelemetry` layer exists. **Logs already work**, because drasi-lib installs a subscriber
-> of its own today — which is also why the ordering in §5 is a correctness requirement rather than a
-> style preference. See
-> [Enabling Telemetry as a drasi-lib Consumer](../../drasi-lib/tracing-logging/00-observability-overview.md#enabling-telemetry-as-a-drasi-lib-consumer).
+This design makes Drasi Server the embedding application that collects them: it wires up the tracing subscriber and metrics recorder so drasi-lib's telemetry flows to external backends (OTLP, Prometheus, stdout).
 
 Drasi Server does not manage or run telemetry backends for the user. It exports traces via OTLP (OpenTelemetry Protocol), which is accepted by most observability tools — Jaeger, Grafana Tempo, Datadog, Honeycomb, New Relic, AWS X-Ray, Azure Monitor, and others. The user points Drasi Server at any OTLP-compatible endpoint and runs their own backend.
 
-## Terms and Definitions
-
-| Term | Definition |
-|------|------------|
-| OTLP | OpenTelemetry Protocol — a standard for exporting traces and metrics to collectors (e.g., Jaeger, Grafana Tempo, Prometheus via OTLP receiver). |
-
-See the [drasi-lib observability overview](../../drasi-lib/tracing-logging/00-observability-overview.md) for definitions of facade crate, span, subscriber, and recorder.
 
 ## Objectives
 
@@ -47,52 +33,6 @@ See the [drasi-lib observability overview](../../drasi-lib/tracing-logging/00-ob
 - Preserve the existing `ComponentLogLayer` and per-component log streaming API endpoints
 - Preserve the existing `logLevel` configuration
 
-### Non-Goals
-
-- Adding new tracing spans specific to Drasi Server's API layer (Axum routes, plugin management). This may be added later.
-  > This is a **phasing statement, not a disagreement with drasi-lib.** drasi-lib traces its *own* control-plane operations (`control.*`) in Phase 1, because every embedder has a control plane whether or not a server sits in front of it. Drasi Server's HTTP-layer spans are Phase 2. The two docs describe different layers — see [01 — Tracing](../../drasi-lib/tracing-logging/01-tracing.md#control-plane-rooting--drasi-libs-own-api).
-- Managing or running telemetry backends (Jaeger, Prometheus, OTLP collectors) on behalf of the user.
-
-## Design Requirements
-
-### Requirements
-
-1. **Backward compatible**: Existing Drasi Server deployments with no telemetry config MUST continue to work — structured logs on stdout with the configured `logLevel`.
-2. **Opt-in telemetry export**: OTLP tracing and metrics export MUST be opt-in via configuration. No external connections by default.
-3. **Layered subscribers**: The `ComponentLogLayer` from drasi-lib MUST be composed into Drasi Server's subscriber alongside the OTLP and fmt layers.
-   ⚠️ **"Coexist" is stronger than it sounds — today they cannot.** drasi-lib installs its own global subscriber via `let _ = set_global_default(...)`, so **first writer wins silently**: install after `DrasiLib` is built and Drasi Server's OTLP layer is ignored; install before and `ComponentLogLayer` never runs, emptying the component log streams that the REST API, CLI and VS Code extension read. Neither ordering yields both, which is why the [initializer split in LIB](../../drasi-lib/tracing-logging/00-observability-overview.md#api-design) is a **prerequisite** for this design rather than a cleanup.
-
-### Dependencies
-
-| Dependency | Version | Purpose | Notes |
-|------------|---------|---------|-------|
-| `drasi-lib` | current | Emits spans and metrics via facades | Existing dependency |
-| `tracing` | `0.1` | Tracing facade | **Move from dev to production dependency** |
-| `tracing-subscriber` | `0.3` | Subscriber composition (Registry, fmt, env-filter) | **New production dependency** |
-| `tracing-opentelemetry` | current | Bridge tracing spans → OTLP | **New dependency** — see version note below |
-| `opentelemetry` | current | OTLP trace/metrics API | **New dependency** — see version note below |
-| `opentelemetry-otlp` | current | OTLP gRPC exporter | **New dependency** |
-| `opentelemetry_sdk` | current | OTel runtime; also supplies `SpanData` for the plugin span bridge | **New dependency** |
-| `metrics` | `0.23+` | Metrics facade — the recorder is installed against it | **New dependency, was missing from this table** |
-| `metrics-util` | `0.20+` | `Stack`, `Fanout`, `FilterLayer`, `Registry` — the layered recorder stack | **New dependency, was missing from this table** |
-| `metrics-exporter-prometheus` | `0.16+` | Prometheus rendering | **New dependency** |
-| `metrics-process` | `2.4+` | Cross-platform process resource metrics (memory, CPU, fds, threads) via the `metrics` facade | **New dependency** |
-
-> ⚠️ **Version note — do not copy the old pins.** This table previously specified `opentelemetry 0.20+`,
-> `tracing-opentelemetry 0.21+` and `opentelemetry-otlp 0.13+`. The OTel Rust crates have moved a long
-> way since (`opentelemetry` and `opentelemetry_sdk` are now at 0.32.x), and those floor versions read
-> as recommendations rather than the minimums they were meant to be. Pin at integration time against
-> whatever is current.
->
-> **There is a real skew to reconcile**: `drasi-core/core/Cargo.toml` still declares
-> `opentelemetry = "0.20"`. It is a **dead dependency** — zero `.rs` references — so it should simply
-> be removed, but until it is, a naive workspace unification could drag the ancient version in.
-
-### Out of Scope
-
-- Server-specific spans for API endpoints, plugin loading, or config parsing.
-- Changes to the existing REST API for component logs/events.
-- Drasi Server web UI changes.
 
 ## Design
 
@@ -120,9 +60,9 @@ Drasi Server currently initializes logging by setting `RUST_LOG` from the YAML c
 │     └───────────────────────────────────────────────────────────┘   │
 │                                                                     │
 │  3. Install metrics recorder (if telemetry.metrics configured):     │
-│     FilterLayer → Fanout → { Registry, exporter }                   │
-│     → Prometheus: /metrics route on the existing API server         │
-│     → OTLP: push to user-provided endpoint                          │
+│     FilterLayer → selected backend recorder                         │
+│     → PrometheusRecorder + Handle.render() at /metrics              │
+│     → OpenTelemetryRecorder + PeriodicReader → OTLP                 │
 │                                                                     │
 │  4. Start DrasiLib instances (unchanged)                            │
 │     → drasi-lib emits spans + metrics through facades               │
@@ -150,9 +90,8 @@ logLevel: info
 # NEW: optional telemetry section
 telemetry:
   profile: basic                          # off | basic | debug | persistence
-  filters:                                # optional targeted overrides on top of the profile
-    include: ["drasi.index."]             # re-admit families the profile suppresses
-    exclude: ["drasi.plugin."]            # suppress families the profile admits
+  filters:                                # optional additional exclusions
+    exclude: ["drasi.plugin."]            # suppress matching metric families
   tracing:
     endpoint: "http://jaeger:4317"       # gRPC OTLP endpoint; omit to disable
     serviceName: "drasi-server"           # OTel service.name resource attribute
@@ -175,14 +114,6 @@ presets, the ladder they form, and the reasoning behind them are defined once in
 Drasi Server does not define its own vocabulary. Defaults to `basic` when the `telemetry` section is
 present, and `off` when it is absent.
 
-> ⚠️ **The profile *mechanism* is Phase 1, even though the config surface is designed here.**
-> Filtering has nothing to act on in Phase 0 — thirteen metrics and seven spans — and the
-> `collection` flags have no Phase 0 consumers either, since backend engine statistics are Phase 2.
-> So in Phase 0 only `off` and `basic` are meaningful, and they reduce to "install no recorder" and
-> "install the recorder". `debug` and `persistence` become distinguishable when Phase 1 lands
-> `FilterLayer` and the collection flags. The whole surface is specified now so that the config file
-> does not change shape between phases, which is worth more than deferring the schema.
-
 **A profile is not only a filter list, and Drasi Server is the component that makes that true.**
 Resolving a profile yields three outputs, and the server must apply all three or the profile is
 silently half-honoured:
@@ -201,24 +132,25 @@ the ownership rule in LIB for why this is structural rather than an oversight.
 
 ##### Filters
 
-`filters` applies targeted adjustments on top of the profile so operators are not forced to step up a
-whole rung to gain one metric family. It is two set operations on the deny list the profile resolves
-to, applied before the `FilterLayer` is constructed:
+`filters.exclude` adds metric-name patterns to the deny list produced by the selected profile:
 
 | Key | Effect |
 |---|---|
 | `exclude` | Add patterns to the deny list — suppress something the profile admits |
-| `include` | Remove patterns from the deny list — re-admit something the profile suppresses |
 
 Patterns are **substrings**, not globs — `metrics_util::layers::FilterLayer` matches with an
 Aho-Corasick automaton across the whole metric key. Write `drasi.index.`, not `drasi.index.*`; a
 trailing `*` matches literally and therefore matches nothing.
 
-Because both operations act on the recorder stack, they can only adjust signals that are **being
-produced**. `include` cannot switch on collection that the profile left off — requesting engine
-statistics under `profile: basic` needs the profile changed, not a filter added. **Drasi Server
-validates this at startup and fails fast** rather than starting with a pattern that can never match,
-which would otherwise present as telemetry silently missing.
+```yaml
+telemetry:
+  profile: persistence
+  filters:
+    exclude: ["drasi.plugin."] # suppress all plugin metrics
+```
+
+Filters can only suppress metrics. To enable metric families or engine statistics that a profile
+does not collect, select a profile that includes them.
 
 All fields support environment variable interpolation:
 
@@ -249,8 +181,17 @@ If no OTLP endpoint is configured, only layers 1 and 2 are active — identical 
 
 On startup, Drasi Server installs a metrics recorder based on the `telemetry.metrics.backend` config:
 
-- **`prometheus`** — serves a `/metrics` scrape endpoint **on the existing management API server**, not a separate listener. drasi-lib's recorder stack keeps a `metrics_util::registry::Registry` branch that can be read in-process, so the endpoint is an ordinary Axum route over structured values rather than a second HTTP server bound to its own port. `telemetry.metrics.prometheus.port` is therefore optional and exists only for deployments that deliberately want the scrape surface isolated from the API surface.
-- **`otlp`** — pushes metrics to the configured OTLP endpoint at a configurable interval
+- **`prometheus`** — build a `metrics_exporter_prometheus::PrometheusRecorder`, retain its
+  `PrometheusHandle`, and wrap the recorder in the profile's `FilterLayer` before installing it
+  globally. The `/metrics` handler calls `PrometheusHandle::render()`. No separate
+  `metrics_util::Registry` is required. `telemetry.metrics.prometheus.port` remains optional for
+  deployments that deliberately isolate the scrape surface.
+- **`otlp`** — configure an OpenTelemetry `PeriodicReader` with an
+  `opentelemetry_otlp::MetricExporter`, add it to an `SdkMeterProvider`, and pass the provider's
+  `Meter` to `metrics_exporter_otel::OpenTelemetryRecorder`. Wrap that recorder in the profile's
+  `FilterLayer` and install it globally. Retain the `SdkMeterProvider` for bounded flush and
+  shutdown. `metrics-exporter-otel` is the concrete adapter from the `metrics` facade to the
+  OpenTelemetry metrics API; `opentelemetry_sdk` alone does not implement `metrics::Recorder`.
 - **`none`** (or the `metrics` section omitted) — no recorder installed, `metrics` facade calls are no-ops. Tracing can still be enabled independently via `telemetry.tracing`.
 
 #### 4. Process Resource Metrics
@@ -272,7 +213,6 @@ The collector emits the standard `process_*` metric family:
 
 Availability of individual metrics varies by platform (e.g., `process_open_fds` is not available on Windows); `metrics-process` handles this per-OS and simply omits unsupported metrics.
 
-**Naming convention**: These use the standard Prometheus `process_*` names rather than the `drasi.` prefix used by pipeline metrics. This is a deliberate, scoped rule: the `drasi.` prefix applies to Drasi-domain metrics (what the pipeline is doing — `drasi.query.events_processed`, `drasi.reaction.errors`), while process/host resource metrics follow their established ecosystem convention (`process_*`, what the OS process is consuming). This mirrors what mature stacks do — e.g., the OTel/Prometheus split between application metrics and `process_*`/host metrics — and means Drasi Server's resource metrics are recognized out-of-the-box by existing Grafana/Prometheus process dashboards and alert rules.
 
 **Collection model**: `metrics-process` requires a periodic `collect()` call to refresh values. The collection point depends on the backend:
 - **Prometheus** — call `collector.collect()` inside the `/metrics` scrape handler, so values are refreshed on-demand only when scraped (no idle cost).
@@ -280,41 +220,6 @@ Availability of individual metrics varies by platform (e.g., `process_open_fds` 
 
 `processMetrics` requires a metrics backend (`prometheus` or `otlp`) to be configured; with `backend: none` there is no recorder to receive the values and the setting is a no-op. It defaults to `false`, so existing deployments are unaffected.
 
-##### Container limits — what `process_*` cannot tell you
-
-**`process_resident_memory_bytes` is not the number that gets you OOM-killed.** In a container the
-kernel kills on the **cgroup**'s accounting, and cgroup v2 `memory.current` includes page cache and
-kernel memory that RSS does not. A Drasi Server with modest RSS can be terminated while
-`process_resident_memory_bytes` still looks healthy — so the process family alone cannot answer the
-one question operators actually alert on: *how much headroom is left before the OOM killer fires?*
-
-The same applies to CPU: `cpu.max` quota, not host core count, determines throttling.
-
-When the files are present, Drasi Server reads them directly and emits:
-
-| Metric | Unit | Source (cgroup v2) | Meaning |
-|---|---|---|---|
-| `drasi.server.cgroup.memory.limit` | `By` | `memory.max` | Hard limit; **absent** when the file reads `max` (unlimited) |
-| `drasi.server.cgroup.memory.current` | `By` | `memory.current` | What the kernel actually counts against the limit |
-| `drasi.server.cgroup.memory.utilization` | `1` | derived | `current / limit` — the headroom signal, and the thing to alert on |
-| `drasi.server.cgroup.cpu.quota` | `{core}` | `cpu.max` (quota ÷ period) | Effective core allowance; **absent** when quota reads `max` |
-| `drasi.server.cgroup.cpu.throttled` | `s` | `cpu.stat` `throttled_usec` | Monotonic time spent throttled — evidence the quota is binding |
-
-> **Naming decision.** These are deliberately **not** `container_*` and **not** `process_*`.
-> `container_*` is cAdvisor's namespace, populated from *outside* the container with different labels
-> — emitting the same names from inside would produce two families with identical names and
-> incompatible semantics, which is exactly the collision the naming convention exists to prevent.
-> `process_*` is process-scoped by ecosystem convention and these values are container-scoped.
-> `drasi.server.*` is correct on the same reasoning that justifies the rest of that namespace: server
-> is a functional domain, and this is *Drasi Server's own view of its container*.
-
-**Degrade silently, never guess.** cgroup v2 is detected by the presence of
-`/sys/fs/cgroup/cgroup.controllers`; v1 uses different paths and sentinels (`memory.limit_in_bytes`
-with a huge value for unlimited, `cpu.cfs_quota_us` of `-1`). On macOS, Windows, or a
-non-containerised Linux host the files are absent. In every one of those cases the metric is **not
-emitted at all** — never zero and never a fabricated default, because a limit metric reading `0` or
-`unlimited` incorrectly is worse than a missing series: it will silently satisfy an alert rule that
-was supposed to fire.
 
 #### 5. Startup Order
 
@@ -327,8 +232,9 @@ was supposed to fire.
 4. Build and install tracing subscriber — EnvFilter(trace_directives) +            (NEW)
    `ComponentLogLayer` + fmt + optional OTLP, composed into one Registry
    (drasi-lib's log worker thread starts here, on Dispatch construction)
-5. Install metrics recorder — FilterLayer(metric_filters) → Fanout → { Registry,  (NEW)
-   exporter }
+5. Build the selected metrics backend, wrap its recorder in                     (NEW)
+  FilterLayer(metric_filters), and install it globally. Retain either the
+  PrometheusHandle or the OTLP SdkMeterProvider.
 6. Install process metrics collector — describe() + wire collect() into scrape/push (NEW)
 7. Construct index providers, passing the storage flags from `collection`          (NEW)
 8. Build and start DrasiLib instances, passing `collection` to the builder       (CHANGED)
@@ -336,19 +242,7 @@ was supposed to fire.
    backend is selected
 ```
 
-**Steps 4 and 5 must precede step 8.** Because drasi-lib installs a subscriber of its own on the
-first `DrasiLib` construction and the install silently no-ops if one already exists, building
-`DrasiLib` first means Drasi Server's OTLP layer is discarded with no error — see Requirement 3.
-
-**Step 7 is the one that is easy to drop.** The `collection` half of a resolved profile has to reach
-the *index-provider constructors*, because backend engine statistics are fixed before drasi-lib is
-handed the provider. Skipping it means `profile: persistence` silently produces no engine statistics.
-This is the step §1's profile table forward-references.
-
 #### 6. Shutdown
-
-🐛 **This is new work, not an extension of an existing path.** Two defects were found while designing
-the [crash-loss semantics](../../drasi-lib/tracing-logging/00-observability-overview.md#export-flush-and-crash-loss-semantics):
 
 1. **`SIGTERM` is not handled.** The shutdown path is `tokio::signal::ctrl_c()` (`src/server.rs:825`),
    which is **`SIGINT` only** — there are no occurrences of `SignalKind`, `signal::unix` or
@@ -372,12 +266,6 @@ The required sequence, and the ordering is load-bearing:
 Under the Prometheus **scrape** branch there is no metrics flush to perform at all: the scrape reads
 current values, so metrics have no unexported window. Steps 3–5 concern traces, and logs if an OTLP
 log layer is composed.
-
-> **Note**: To compose `ComponentLogLayer` into Drasi Server's subscriber alongside the OTLP layer, drasi-lib's `get_or_init_global_registry()` is replaced by two functions (see [drasi-lib observability overview, API Design](../../drasi-lib/tracing-logging/00-observability-overview.md#api-design)):
-> - `init_component_log_layer()` — returns the layer for Drasi Server to compose, installing nothing
-> - `init_default_subscriber()` — composes and installs, for simple embedders
->
-> Drasi Server calls `init_component_log_layer()` and composes the returned layer with fmt + OTLP into its own subscriber. The drasi-lib log worker thread starts when Drasi Server installs that subscriber, not when the layer is created.
 
 ### API Design
 
@@ -464,7 +352,7 @@ Always export to OTLP, require users to run an OpenTelemetry Collector to fan ou
 ## Compatibility Impact
 
 - **No breaking changes for Drasi Server operators**: existing configs without a `telemetry` section work exactly as before, and no REST endpoint changes shape.
-- **New dependencies**: `tracing-opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk`, `metrics`, `metrics-util`, `metrics-exporter-prometheus`, `metrics-process`. They are only active when configured.
+- **New dependencies**: `tracing-opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk`, `metrics`, `metrics-util`, `metrics-exporter-prometheus`, `metrics-exporter-otel`, `metrics-process`. They are only active when configured.
 - **The drasi-lib initializer split is a prerequisite, not a nicety.** Earlier drafts called this "a minor refactor". It is the only way to have OTLP export and working component log streams simultaneously — without it one of the two is silently lost, with no error on either branch. See Requirement 3.
   > It is also a **breaking change to drasi-lib's public API**: `get_or_init_global_registry()` is removed rather than aliased. That breaks *other* drasi-lib embedders, not Drasi Server — Drasi Server is being changed here anyway. Rationale in [LIB — API Design](../../drasi-lib/tracing-logging/00-observability-overview.md#api-design).
 - **`SIGTERM` handling is new.** The server currently handles `SIGINT` only, so adding graceful shutdown is a behaviour change in its own right — a container that previously died abruptly on pod termination will now stop components and flush first.
@@ -504,13 +392,12 @@ text, and spans arrive at a mock OTLP receiver.
 | Default config (no telemetry) | Integration | Start server with no `telemetry` section; verify stdout logs appear, no crashes |
 | OTLP tracing | Integration | Configure endpoint to mock OTLP receiver; verify spans arrive |
 | Prometheus scrape | Integration | Enable Prometheus backend; `curl localhost:8080/metrics` on the **API port**; verify drasi-lib metrics appear |
-| OTLP metrics | Integration | Configure OTLP metrics endpoint; verify metrics arrive at mock receiver |
+| OTLP metrics | Integration | Configure OTLP metrics endpoint; verify a counter, gauge, and histogram arrive at a mock receiver with attributes and units intact |
 | Process metrics | Integration | Enable `processMetrics` with Prometheus backend; `curl localhost:8080/metrics`; verify `process_resident_memory_bytes` and `process_cpu_seconds_total` appear with non-zero values |
 | Env var override | Unit | Set `OTEL_ENDPOINT` env var; verify config resolves correctly |
 | **SIGTERM handled** | Integration | Send `SIGTERM` (not `SIGINT`) and assert the process shuts down gracefully — this fails today |
 | Shutdown flush | Integration | Send SIGTERM; verify pending spans are exported before exit |
 | **Profile applied in full** | Integration | Set `profile: persistence` and assert RocksDB statistics actually appear — guards the failure where only the filter half of a profile is applied |
-| **Unsatisfiable filter rejected** | Unit | `profile: basic` + `include: ["drasi.index.rocksdb."]` must fail at startup, not start with a pattern that can never match |
 | Unreachable endpoint | Integration | Configure non-existent OTLP endpoint; verify server starts gracefully, logs warning |
 
 ## Development Plan
@@ -522,24 +409,18 @@ text, and spans arrive at a mock OTLP receiver.
 | Step | Work Items |
 |-------|-----------|
 | 1. Config types | Add `TelemetryConfig`, `TracingConfig`, `MetricsConfig`, `FilterConfig` structs to `config/types.rs` with serde deserialization + env var interpolation |
-| 1a. Profile wiring | Resolve `TelemetryProfile` once at startup; apply all three outputs (directives, filters, collection) and **fail fast** on a filter that can never match |
-| 2. Dependencies | Add `tracing-opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk`, `metrics`, `metrics-util`, `metrics-exporter-prometheus`, `metrics-process` to `Cargo.toml` |
+| 1a. Profile wiring | Resolve `TelemetryProfile` once at startup and apply all three outputs: directives, filters, and collection flags |
+| 2. Dependencies | Add `tracing-opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk`, `metrics`, `metrics-util`, `metrics-exporter-prometheus`, `metrics-exporter-otel`, `metrics-process` to `Cargo.toml` |
 | 3. Builder API | Add `.with_telemetry_profile()`, `.with_tracing_endpoint()`, `.with_tracing_service_name()`, `.with_metrics_prometheus()`, `.with_metrics_otlp()`, `.with_process_metrics()` to `DrasiServerBuilder` |
 | 4. Tracing setup | Implement `init_tracing()` — compose Registry with EnvFilter + fmt + ComponentLogLayer + optional OTLP. Depends on the drasi-lib `init_component_log_layer()` split |
-| 5. Metrics setup | Implement `init_metrics()` — `FilterLayer` → `Fanout` → { Registry, exporter }; mount `/metrics` as a route on the existing API server |
+| 5. Metrics setup | Implement `init_metrics()` with `PrometheusRecorder` + retained `PrometheusHandle`, or `OpenTelemetryRecorder` + retained `SdkMeterProvider`; wrap the selected recorder in `FilterLayer` and mount `/metrics` for Prometheus |
 | 5a. Process metrics | Install `metrics-process` `Collector` when `processMetrics` is enabled; wire `collect()` into the `/metrics` handler and/or the OTLP push interval |
 | 6. `init` CLI | Extend `drasi-server init` with telemetry prompts (profile, OTLP endpoint, service name, metrics backend, process metrics) |
 | 7. Shutdown | **Add a `SIGTERM` handler** — the server handles `SIGINT` only today — then sequence `DrasiLib::shutdown()` → telemetry flush → runtime teardown, with a bounded flush timeout (§6) |
 | 8. Tests | Integration tests per backend config, graceful degradation, `SIGTERM`, and the profile-applied-in-full check |
 | 9. Documentation | Update Drasi Server docs with telemetry configuration reference |
 
-## Open Issues
-
-1. ~~**Metrics port conflict**~~ — **RESOLVED: serve `/metrics` from the existing management API server.** The layered recorder stack keeps a `metrics_util::registry::Registry` branch alongside the exporter, so metrics are readable in-process as structured values and the scrape endpoint is just another Axum route. No second listener, no second port to open in a network policy, and no `PrometheusHandle::render()` string to re-parse. §3 above is written accordingly. See [02 — Metrics §2](../../drasi-lib/tracing-logging/02-metrics.md#2-collection-architecture).
-
-2. ~~**Trace sampling**~~ — **RESOLVED elsewhere, deliberately.** The policy — head-based, decided at the source root, propagated on the W3C sampled bit already present in the FFI trace context, never applied to control-plane or bootstrap spans — is settled once in [01 — Tracing, Open Issue 3](../../drasi-lib/tracing-logging/01-tracing.md#open-issues). Drasi Server owns only the **rate**, and even that is normally set by `telemetry.profile` rather than configured per-deployment. A `samplingRate` override under `telemetry.tracing` is a Phase 1 addition; it must not become a second, competing definition of how sampling works.
-
-### Future Consideration: Server-Level Metrics
+## Appendix — Future Server-Level Metrics
 
 Beyond drasi-lib's pipeline metrics (source events, query processing, reaction delivery) and the process resource metrics added by this design (`process_*` from `metrics-process`), a future iteration could add Drasi Server's own *application-level* operational metrics for remote monitoring and management — e.g., `drasi.server.uptime` (unit `s`), `drasi.server.sources` (by status), `drasi.server.api.requests`, `drasi.server.api.request.duration` (unit `s`), and `drasi.server.config.saves`. These are distinct from process resource metrics: they describe application state and API traffic rather than OS-level resource usage. They would be recorded in Axum middleware and server lifecycle code (not in drasi-lib) and flow to whatever recorder the telemetry config installs. Names follow the [OpenTelemetry naming convention](../../drasi-lib/tracing-logging/00-observability-overview.md#naming-and-namespacing-conventions), with units and instrument type carried as metadata. This is not in scope for this design but is a natural next step once the telemetry infrastructure is in place.
 
