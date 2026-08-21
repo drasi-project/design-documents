@@ -1,7 +1,7 @@
 # Tracing for drasi-lib
 
 * Project Drasi - Ruokun Niu (@ruokun-niu)
-* Last edited on August 19th, 2026
+* Last edited on August 20th, 2026
 
 > Part of the drasi-lib observability design set. Read
 > [00 — Overview and Shared Foundations](00-observability-overview.md) first: it defines the facade
@@ -365,7 +365,7 @@ The application owns the exporter and must flush it during shutdown. The complet
 dependencies, profiles, and shutdown notes are in
 [Enabling Telemetry as a drasi-lib Consumer](00-observability-overview.md#enabling-telemetry-as-a-drasi-lib-consumer).
 
-### Span Names
+### Span Naming and Namespacing
 
 The tables below are the complete inventory of span names this design currently proposes. This is open to discussion for additional spans.
 
@@ -417,11 +417,16 @@ lowercase, dot-separated, no `drasi.` prefix (because span names are not global 
 than the span name. Spans that bracket a plugin call also carry `plugin_kind`, read from
 `Source::type_name()` or `Reaction::type_name()`.
 
-### Standard Spans for Every Plugin Kind
+### Standard Spans for Component Plugins
 
 Plugin tracing has three tiers: host-emitted boundary spans, standard spans for each plugin kind,
 and spans added by the plugin author. The catalogue above lists the complete proposed names; this
 section explains who emits them and what each tier guarantees.
+
+This tracing contract covers sources, reactions, bootstrap providers, identity providers, and
+secret stores. Index, state-store, and WAL operations are high-frequency in-process calls; their
+automatic operation counts, latency, and errors are metrics defined in
+[02 — Metrics](02-metrics.md#83-tier-2--the-per-kind-standard-set), not standard spans.
 
 **A new plugin author implements none of Tier 1 or Tier 2.** Those tiers are part of Drasi's host
 and SDK contract and appear automatically when the plugin implements its normal interface:
@@ -468,7 +473,7 @@ metrics tiering rests on.
 |---|---|---|
 | **Source** | `source.produce` | Framework dispatch of completed `SourceChange`(s). Adopts valid inbound context or roots a new trace — see [Trace Rooting](#trace-rooting-and-lifetimes) |
 | | `source.subscribe` | The host's subscribe call, including bootstrap setup |
-| **Bootstrap provider** | `bootstrap.snapshot` | One per `BootstrapRequest`, tagged `request_id`. **Not per element** — see [granularity](#bootstrap-rooting--decided-the-query-is-the-root) |
+| **Bootstrap provider** | `bootstrap.snapshot` | One per `BootstrapRequest`, tagged `request_id`. **Not per element** — see [Bootstrap flow](#bootstrap-flow) |
 | **Reaction** | `reaction.deliver` | Pull from the host through to enqueue |
 | | `reaction.handle` | Dequeue through to completion — the actual outbound work |
 | **Identity provider** | `identity.resolve` | One credential resolution, usually network I/O |

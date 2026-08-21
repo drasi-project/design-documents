@@ -108,6 +108,20 @@ The pipeline spans five Tokio tasks connected by channels and priority queues:
 Source Plugin -> Query Forwarder -> Query Processor -> Reaction Forwarder -> Reaction Processor
 ```
 
+The designs use the following interval labels:
+
+| Interval | Measurement |
+|---|---|
+| A | Source dispatch: wrap a change and send it to the query channel |
+| B | Source-to-query channel wait |
+| C | Query priority-queue wait |
+| D | Query-engine execution inside `process_source_change()` |
+| E | Result conversion and dispatch to reaction channels |
+| F | Query-to-reaction channel wait |
+| G | Reaction queueing and plugin processing |
+
+`A→G` means the complete measured path from source dispatch through reaction completion.
+
 Tracing records the path of an individual event across these boundaries. Metrics aggregate the
 same boundaries into throughput, latency, queue, error, and health instruments. Existing
 `ProfilingMetadata` timestamps provide the source for end-to-end and stage latency measurements.
@@ -156,7 +170,7 @@ The bridge is library-scoped and installed once per loaded plugin library. This 
 use normal `tracing` and `metrics` APIs without owning an exporter. The host retains control over
 sampling, filtering, and destinations.
 
-Plugin-specific span tiers are defined in [01 - Tracing](01-tracing.md#standard-spans-for-every-plugin-kind),
+Plugin-specific span tiers are defined in [01 - Tracing](01-tracing.md#standard-spans-for-component-plugins),
 and metric tiers are defined in [02 - Metrics](02-metrics.md#81-the-three-tiers).
 
 ### Observability Profiles
