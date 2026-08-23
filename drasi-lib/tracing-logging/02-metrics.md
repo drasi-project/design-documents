@@ -171,7 +171,7 @@ This design plans to implement thirteen metrics, chosen to be
 the smallest surface that proves the architecture end to end — facade → recorder → exporter →
 dashboard.
 
-A further 61 candidate metrics across eleven categories are recorded in
+A further 62 candidate metrics across eleven categories are recorded in
 [Appendix A](#appendix-a--future-metrics-p1p3) for future work (open to discussion)
 
 Each row below carries:
@@ -430,15 +430,18 @@ collection gate that does not exist.
 
 #### 6.6 Clock Source for Latency Histograms
 
-Durations must use a monotonic clock. The current nanosecond stamps come from `SystemTime`, which
-can move backwards after an NTP or manual clock adjustment and corrupt an unsigned histogram
-duration.
+Internal processing durations must use a monotonic clock. The current nanosecond stamps come from
+`SystemTime`, which can move backwards after an NTP or manual clock adjustment and corrupt an
+unsigned histogram duration.
 
 Each interval A–G is therefore measured with an `Instant` pair in one process and clock domain.
-`SystemTime` remains only for absolute timestamps that must correlate with an external system.
-`Instant` values never cross FFI; plugin-internal durations are measured inside the plugin and
-reported as completed observations. The enforceable rule is: never subtract two `SystemTime`
-stamps to produce a duration.
+`SystemTime` remains for absolute timestamps that must correlate with an external system. The sole
+subtraction exception is `drasi.source.origin_lag`: origin and receive may be in different clock
+domains, so it is an operational lag estimate rather than an internal processing duration. Missing
+or negative values are skipped, and positive clock skew may inflate the observation. `Instant`
+values never cross FFI; plugin-internal durations are measured inside the plugin and reported as
+completed observations. The enforceable rule is: never subtract two `SystemTime` stamps for an
+internal interval A–G.
 
 
 ### 7. Environment and Storage Metrics
@@ -776,6 +779,7 @@ See also [00 — Overview](00-observability-overview.md#requirements) — Requir
 | Recorder installed after components are built | Unit | Build a pipeline, install a recorder *afterwards*, then process events; assert the metrics are empty. This pins the ordering constraint in §2 so it cannot regress silently |
 | Queue promotion fidelity | Unit | With `DebuggingRecorder`, drive a `PriorityQueue` to capacity; assert `drasi.queue.depth`, `drasi.queue.depth_max`, `drasi.queue.drops` and `drasi.queue.blocked_enqueues` match the existing `PriorityQueueMetrics::snapshot()` values exactly. The promoted metric and the existing struct must never disagree |
 | Latency histograms from profiling stamps | Unit | Push events through a mock pipeline; assert `drasi.query.engine.duration` and `drasi.pipeline.end_to_end.duration` record non-zero samples derived from the stamped `ProfilingMetadata` timestamps |
+| Source origin lag | Unit | Supply valid `source_ns` and `source_receive_ns` values and assert `drasi.source.origin_lag` records their difference; omit either timestamp or provide a receive time before origin and assert no observation is recorded |
 | Monotonic clock | Unit | Step the wall clock backwards mid-run; assert no histogram records a negative-turned-huge value (§6.6) |
 | No `SystemTime` subtraction | Unit / lint | Assert every interval A–G is computed from an `Instant` pair. A grep-level check that no duration is derived by subtracting two `_ns` wall-clock fields is enough to pin the §6.6 rule |
 | `phase` separation | Unit | Push bootstrap and steady-state events through the same query; assert `drasi.pipeline.end_to_end.duration` produces two distinct attribute sets and that the bootstrap samples do not appear in the steady-state distribution (§4.1) |
@@ -792,7 +796,7 @@ See also [00 — Overview](00-observability-overview.md#requirements) — Requir
 
 ## Appendix A — Future Metrics (P1–P3)
 
-**Not part of the Phase 0 commitment.** This appendix records the remaining 61 candidate metrics so
+**Not part of the Phase 0 commitment.** This appendix records the remaining 62 candidate metrics so
 the Phase 0 cut can be judged against the full picture, and so later phases have a starting point.
 Names, labels and phase assignments here are indicative and not agreed.
 
@@ -801,7 +805,7 @@ Names, labels and phase assignments here are indicative and not agreed.
 
 | Category | P1 | P2 | P3 | Total |
 |---|---|---|---|---|
-| A.1 Pipeline latency | 6 | — | — | 6 |
+| A.1 Pipeline latency | 7 | — | — | 7 |
 | A.2 Pipeline throughput | 2 | — | — | 2 |
 | A.3 Queue and backpressure | 3 | 1 | — | 4 |
 | A.4 Query engine and results | 4 | 2 | 1 | 7 |
@@ -812,7 +816,7 @@ Names, labels and phase assignments here are indicative and not agreed.
 | A.9 Reaction plugins | 4 | 2 | — | 6 |
 | A.10 Storage | — | 7 | 2 | 9 |
 | A.11 Tokio runtime | — | — | 2 | 2 |
-| **Total** | **31** | **24** | **6** | **61** |
+| **Total** | **32** | **24** | **6** | **62** |
 
 Broadly: **P1** completes the categories Phase 0 samples and is where the plugin SDK gains a
 telemetry surface. **P2** adds the categories needing new collection mechanisms — chiefly storage
@@ -826,6 +830,7 @@ seconds, all derived from existing `ProfilingMetadata` stamps (§3.3).
 
 | Metric | Type | Labels | Interval | Origin | Phase |
 |---|---|---|---|---|---|
+| `drasi.source.origin_lag` | histogram (`s`) | `source_id` | change origin → source receive | derive when `source_ns` and `source_receive_ns` are valid | P1 |
 | `drasi.source.dispatch.duration` | histogram (`s`) | `source_id` | A | derive | P1 |
 | `drasi.query.ingest_wait.duration` | histogram (`s`) | `query_id`, `source_id` | B | derive | P1 |
 | `drasi.query.queue_wait.duration` | histogram (`s`) | `query_id` | C | derive | P1 |

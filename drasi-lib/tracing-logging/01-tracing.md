@@ -125,8 +125,9 @@ fields and carriers are defined in the
 
 #### Source Change flow
 
-The first Drasi span starts inside `SourceBase`; it adopts valid incoming context or roots a new
-trace.
+The first live Drasi span starts inside `SourceBase`; `source.produce` adopts valid incoming context
+or roots a new trace. When valid origin and receive timestamps are available, a future retrospective
+`source.origin` span may precede it.
 
 ```mermaid
 sequenceDiagram
@@ -136,8 +137,8 @@ sequenceDiagram
   participant SK as PluginSpanSink (embedder)
 
   U->>SP: source record + optional traceparent
-  Note over SP: Decode and construct SourceChange
-  Note over SP: SourceBase opens source.produce<br/>parent = inbound span, or ROOT if absent
+  Note over SP: Optional source.origin (retrospective)<br/>origin time → source receive
+  Note over SP: SourceBase opens source.produce<br/>source receive → pre-dispatch<br/>parent = source.origin, inbound span, or ROOT
   SP->>H: FfiChangePushCallbackFn(FfiSourceEvent + trace context)
   Note over H: Open source.dispatch<br/>parent = source.produce
   SP->>SP: source.produce closes
@@ -309,18 +310,27 @@ The source-change flow above shows the simple case: 1 source → 1 query → 1 r
 ```
 source.dispatch { source_id=postgres-src, element_id=Order:42,
                   source.dispatch_id=d-7f3a, chunk_index=0, chunk_count=1 }
-├──► query.receive { query_id=q1 }                                        ← fan-out #1: N queries
-│    └── query.process { query_id=q1 }
-│        └── query.dispatch { query_id=q1, added=1 }
-│            ├──► reaction.deliver { reaction_id=webhook }                 ← fan-out #2: M reactions
-│            └──► reaction.deliver { reaction_id=logger }
-├──► query.receive { query_id=q2 }
-│    └── query.process { query_id=q2 }
-│        └── query.dispatch { query_id=q2, added=0 }                      ← no results = no reaction spans
-└──► query.receive { query_id=q3 }
-     └── query.process { query_id=q3 }
-         └── query.dispatch { query_id=q3, added=1 }
-             └──► reaction.deliver { reaction_id=webhook }                 ← same reaction, different query
+├──► query.ingest_wait { query_id=q1 }                                    ← debug profile; interval B
+│    └── query.receive { query_id=q1 }                                    ← fan-out #1: N queries
+│        └── query.queue_wait { query_id=q1 }                             ← debug profile; interval C
+│            └── query.process { query_id=q1 }
+│                └── query.dispatch { query_id=q1, added=1 }
+│                    ├──► reaction.dispatch_wait { reaction_id=webhook }  ← debug profile; interval F
+│                    │    └── reaction.deliver { reaction_id=webhook }    ← fan-out #2: M reactions
+│                    └──► reaction.dispatch_wait { reaction_id=logger }
+│                         └── reaction.deliver { reaction_id=logger }
+├──► query.ingest_wait { query_id=q2 }
+│    └── query.receive { query_id=q2 }
+│        └── query.queue_wait { query_id=q2 }
+│            └── query.process { query_id=q2 }
+│                └── query.dispatch { query_id=q2, added=0 }              ← no results = no reaction spans
+└──► query.ingest_wait { query_id=q3 }
+     └── query.receive { query_id=q3 }
+         └── query.queue_wait { query_id=q3 }
+             └── query.process { query_id=q3 }
+                 └── query.dispatch { query_id=q3, added=1 }
+                    └──► reaction.dispatch_wait { reaction_id=webhook }
+                         └── reaction.deliver { reaction_id=webhook }     ← same reaction, different query
 ```
 
 Changes passed together to `dispatch_events_batch()` share a trace, up to
@@ -328,12 +338,13 @@ Changes passed together to `dispatch_events_batch()` share a trace, up to
 `source.dispatch_id` and an incremented `chunk_index`. See
 [batch semantics](#per-source-capability).
 
-All branches share the same `trace_id`. `source.produce` is the first Drasi span; it is either a
-child of the incoming span or the trace root when no parent exists. In Jaeger this renders as a
-single expandable trace tree. When no `tracing::Subscriber` is installed, a disabled `info_span!()`
-costs an atomic load and a branch and allocates nothing — near-zero, not literally zero. When a
-subscriber is installed, the cost is proportional to the pipeline topology that the user explicitly
-configured. Each span is ~200 bytes in a typical subscriber (span name + fields + timestamps).
+All branches share the same `trace_id`. `source.produce` is the first live Drasi span; it is either a
+child of the optional retrospective `source.origin`, a child of the incoming span, or the trace root
+when neither predecessor exists. In Jaeger this renders as a single expandable trace tree. When no
+`tracing::Subscriber` is installed, a disabled `info_span!()` costs an atomic load and a branch and
+allocates nothing — near-zero, not literally zero. When a subscriber is installed, the cost is
+proportional to the pipeline topology that the user explicitly configured. Each span is ~200 bytes
+in a typical subscriber (span name + fields + timestamps).
 
 ### Viewing and Exporting Spans
 
@@ -370,6 +381,38 @@ dependencies, profiles, and shutdown notes are in
 
 The tables below are the complete inventory of span names this design currently proposes. This is open to discussion for additional spans.
 
+#### Source ingress
+
+Source ingress has two intervals before the existing host-side dispatch interval A. The live
+`source.produce` span is part of the standard set. The origin interval is retrospective because its
+start predates Drasi receiving the change; it is initially represented by
+`drasi.source.origin_lag` and may gain a backdated span in Phase 2.
+
+| Span / metric | Interval | Timestamps | Signal choice | Parenting |
+|---|---|---|---|---|
+| `source.origin` / `drasi.source.origin_lag` | Change origin → accepted by Drasi | `source_ns` → `source_receive_ns` | Histogram initially; optional backdated completed span in Phase 2. Skip when either timestamp is absent or the interval is invalid because of clock skew | Remote parent → `source.origin` → `source.produce`; without the retrospective span, `source.produce` uses the remote parent directly |
+| `source.produce` | Accepted by `SourceBase` → immediately before FFI callback or in-process dispatch | `source_receive_ns` → `source_send_ns` | Live Tier 2 span | Child of `source.origin` when emitted, otherwise the inbound remote parent or a new root; parent of `source.dispatch` |
+| `source.dispatch` | Wrap and send to the query channel (interval A) | `source_send_ns` → query-channel send | Live Tier 1 span and `drasi.source.dispatch.duration` histogram | Child of `source.produce`; parent of each query branch |
+
+#### Channel and queue waits
+
+Intervals B, C, and F are represented in two forms. Histograms provide aggregate monitoring in
+normal profiles. The `debug` profile additionally emits retrospective wait spans so an individual
+trace shows where an event was held in a channel or priority queue.
+
+| Interval | Span | Start → end | Parenting |
+|---|---|---|---|
+| B | `query.ingest_wait` | Source channel send → query forwarder receive | `source.dispatch` → `query.ingest_wait` → `query.receive` |
+| C | `query.queue_wait` | Query priority-queue enqueue → dequeue | `query.receive` → `query.queue_wait` → `query.process` |
+| F | `reaction.dispatch_wait` | Reaction channel send → reaction forwarder receive | `query.dispatch` → `reaction.dispatch_wait` → `reaction.deliver` |
+
+The receiver creates each completed wait span from the enqueue/send and receive/dequeue timestamps
+carried in `ProfilingMetadata`. Because the true start precedes receiver execution, these are
+backdated spans rather than ordinary live spans. Each wait span shares the event's existing
+`trace_id`, uses the sending stage as its parent, and becomes the parent of the receiving stage.
+When either timestamp is missing or invalid, the wait span is omitted without breaking the
+surrounding trace.
+
 #### Host data plane
 
 | Span | Emitted by | Frequency | Key fields |
@@ -377,9 +420,12 @@ The tables below are the complete inventory of span names this design currently 
 | `source.dispatch_batch` | Source fan-out (T1) | Once per batch, batch path only | `source_id`, `event_count`, `lock_wait_us` |
 | `source.dispatch` | Source fan-out (T1) | Once per source change | `source_id`, `op`, `label`, `element_id`, `subscriber_count`, `presend_wait_us`, `postsend_wait_us` |
 | `source.subscriber_send` | Source fan-out (T1) | Once per subscribed query per change | `query_id`, `subscriber_index`, `suppressed` |
+| `query.ingest_wait` | Query forwarder (T2) | Once per query branch under the `debug` profile | `source_id`, `query_id`, `wait_ms` |
 | `query.receive` | Query forwarder (T2) | Once per query branch | `source_id`, `query_id` |
+| `query.queue_wait` | Event processor (T3) | Once per query branch under the `debug` profile | `query_id`, `wait_ms` |
 | `query.process` | Event processor (T3) | Once per change and query; once per due future | `query_id`, `source_id`, optional `trigger`, `pending_ms` |
 | `query.dispatch` | Event processor (T3) | Once per processed query branch | `query_id`, `added`, `updated`, `deleted` |
+| `reaction.dispatch_wait` | Reaction forwarder | Once per reaction branch under the `debug` profile | `reaction_id`, `query_id`, `wait_ms` |
 | `source.futures_due` | Future-queue drain | Once per non-empty drain | `source_id`, `query_id`, `due_time`, `lateness_ms`, `futures_processed` |
 
 #### Bootstrap
@@ -507,8 +553,9 @@ Producing:
 
 ```
 [optional upstream span]
-└── source.produce { source_id=orders-kafka }    ← automatic tier 2; root if no upstream
-  └── source.dispatch { … }                    ← host, child of source.produce
+└── [source.origin]                              ← optional retrospective Phase 2 span
+    └── source.produce { source_id=orders-kafka }  ← automatic tier 2; root if no predecessors
+        └── source.dispatch { … }                  ← host, child of source.produce
 ```
 
 Context-capable adapters such as HTTP and Kafka must still extract `traceparent` from their
@@ -564,9 +611,11 @@ Different parents are split before the size cap is applied.
 
 ### Retrospective Spans
 
-Retrospective spans are deferred. Supporting them later requires:
+Retrospective spans are deferred to Phase 2. Supporting `source.origin` and the B/C/F wait spans
+requires:
 
-1. Source plugins to populate origin and reactivator timestamps in `ProfilingMetadata`.
+1. Source plugins to populate origin and reactivator timestamps in `ProfilingMetadata`, while the
+  host preserves the existing enqueue/send and receive/dequeue stamps for B/C/F.
 2. Those timestamps to survive static and FFI event transport without changing clock domains.
 3. drasi-lib to convert completed intervals into backdated `SpanData` through the same export path
   used by `PluginSpanSink`.
@@ -575,8 +624,10 @@ Retrospective spans are deferred. Supporting them later requires:
 5. An opt-in observability profile because adding channel and queue-wait spans substantially
   increases span volume.
 
-Until these prerequisites exist, pre-dispatch latency remains a metrics concern rather than a
-trace span.
+Until these prerequisites exist, origin-to-receive latency is represented by
+`drasi.source.origin_lag` rather than a trace span. The live receive-to-pre-dispatch interval remains
+covered by `source.produce`. B/C/F remain represented by their histograms until their Phase 2 wait
+spans are enabled through the `debug` profile.
 
 ## Supportability
 
@@ -588,6 +639,8 @@ trace span.
 | Trace connectivity | Unit | Push an event through a mock pipeline and assert all spans share one `trace_id` with the expected parent-child nesting across task boundaries |
 | End-to-end with OTLP | Manual / Integration | Example app with `tracing-opentelemetry` + Jaeger; verify spans appear in Jaeger UI with correct nesting and fields |
 | Inbound trace parent | Integration | Supply an external `traceparent` at a source and assert `source.produce` keeps its `trace_id`, creates a new span id, and records the external span id as its parent |
+| Source ingress intervals | Unit | Supply origin, receive, and send timestamps; assert `drasi.source.origin_lag` records origin-to-receive latency and `source.produce` covers receive-to-send before parenting `source.dispatch`. Omit or skew the origin timestamp and assert no origin-lag observation is recorded |
+| Channel and queue wait spans | Integration | Under the `debug` profile, run an event through non-empty source, query, and reaction queues; assert B, C, and F appear as backdated `query.ingest_wait`, `query.queue_wait`, and `reaction.dispatch_wait` spans between the correct sending and receiving stages. Under `basic`, assert the histograms remain but the wait spans are absent |
 | Plugin span nesting | Integration | Load a cdylib plugin that emits its own span; assert it is exported under the pipeline `trace_id` with the host span as parent |
 | Head-of-line blocking at fan-out | Integration | Subscribe several queries, saturate one subscriber's channel, and assert the `source.subscriber_send` spans for subscribers *behind* it show the stall — this is the failure the span exists to expose |
 | Batch dispatch shape | Integration | Drive a source that uses `dispatch_events_batch` (Oracle or MSSQL) and assert every per-event `source.dispatch` parents under one `source.dispatch_batch`, with the batch-entry lock wait on the parent rather than reading ≈0 on each child |
