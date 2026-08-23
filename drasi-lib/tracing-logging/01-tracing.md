@@ -407,8 +407,7 @@ trace shows where an event was held in a channel or priority queue.
 | F | `reaction.dispatch_wait` | Reaction channel send → reaction forwarder receive | `query.dispatch` → `reaction.dispatch_wait` → `reaction.deliver` |
 
 The receiver creates each completed wait span from the enqueue/send and receive/dequeue timestamps
-carried in `ProfilingMetadata`. Because the true start precedes receiver execution, these are
-backdated spans rather than ordinary live spans. Each wait span shares the event's existing
+carried in `ProfilingMetadata`. Each wait span shares the event's existing
 `trace_id`, uses the sending stage as its parent, and becomes the parent of the receiving stage.
 When either timestamp is missing or invalid, the wait span is omitted without breaking the
 surrounding trace.
