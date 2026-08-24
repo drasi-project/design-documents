@@ -355,13 +355,16 @@ before constructing `DrasiLib`. This setup prints completed spans locally:
 use drasi_lib::DrasiLib;
 use tracing_subscriber::{fmt::format::FmtSpan, prelude::*};
 
+let component_logs = drasi_lib::init_component_logging();
+
 tracing_subscriber::registry()
-  .with(drasi_lib::init_component_log_layer())
+  .with(component_logs.layer())
   .with(tracing_subscriber::fmt::layer().with_span_events(FmtSpan::CLOSE))
   // Add for export: .with(tracing_opentelemetry::layer().with_tracer(tracer))
   .init();
 
 let drasi = DrasiLib::builder().build().await?;
+// Retain component_logs until shutdown, then drain it before exporter teardown.
 ```
 
 ```mermaid
@@ -641,6 +644,7 @@ spans are enabled through the `debug` profile.
 | Source ingress intervals | Unit | Supply origin, receive, and send timestamps; assert `drasi.source.origin_lag` records origin-to-receive latency and `source.produce` covers receive-to-send before parenting `source.dispatch`. Omit or skew the origin timestamp and assert no origin-lag observation is recorded |
 | Channel and queue wait spans | Integration | Under the `debug` profile, run an event through non-empty source, query, and reaction queues; assert B, C, and F appear as backdated `query.ingest_wait`, `query.queue_wait`, and `reaction.dispatch_wait` spans between the correct sending and receiving stages. Under `basic`, assert the histograms remain but the wait spans are absent |
 | Plugin span nesting | Integration | Load a cdylib plugin that emits its own span; assert it is exported under the pipeline `trace_id` with the host span as parent |
+| Span-handle lifecycle | Integration | Capture span open/close events while exercising fan-out completion, task cancellation, outbox eviction, and shutdown. Assert every created pipeline span closes within a bounded time and no envelope, queue entry, or outbox item retains a span handle afterward |
 | Head-of-line blocking at fan-out | Integration | Subscribe several queries, saturate one subscriber's channel, and assert the `source.subscriber_send` spans for subscribers *behind* it show the stall — this is the failure the span exists to expose |
 | Batch dispatch shape | Integration | Drive a source that uses `dispatch_events_batch` (Oracle or MSSQL) and assert every per-event `source.dispatch` parents under one `source.dispatch_batch`, with the batch-entry lock wait on the parent rather than reading ≈0 on each child |
 | Dispatch batch shares one trace | Integration | Pass several changes to `dispatch_events_batch()`, below the cap, and assert every change lands in one `trace_id` carrying a common `source.dispatch_id` |

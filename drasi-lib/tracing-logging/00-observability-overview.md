@@ -115,7 +115,7 @@ The designs use the following interval labels:
 | A | Source dispatch: wrap a change and send it to the query channel |
 | B | Source-to-query channel wait |
 | C | Query priority-queue wait |
-| D | Query-engine execution inside `process_source_change()` |
+| D | Core query evaluation shared by bootstrap, live changes, and due futures; excludes outer checkpoint, hook, and commit work |
 | E | Result conversion and dispatch to reaction channels |
 | F | Query-to-reaction channel wait |
 | G | Reaction queueing and plugin processing |
@@ -224,12 +224,14 @@ initialization surface is:
 
 | Function | Behavior |
 |----------|----------|
-| `init_component_log_layer()` | Returns `ComponentLogLayer` without installing a subscriber |
-| `init_default_subscriber()` | Installs the existing default logging composition for simple embedders |
+| `init_component_logging()` | Returns a `ComponentLogRuntime` containing the composable `ComponentLogLayer`, registry access, bounded sender and worker ownership, and a shutdown/drain handle. It installs no logger, formatter, filter, or global subscriber |
+| `init_default_subscriber()` | Returns the component-log runtime or an error if a global subscriber already exists. Applications with an existing subscriber use `init_component_logging()` and compose its layer themselves |
 | `TelemetryProfile::resolve()` | Returns trace directives, metric filters, and collection flags |
 
 `get_or_init_global_registry()` is replaced by the two explicit initialization functions so custom
-embedders can compose the component log layer with trace export.
+embedders can compose the component log layer with trace export. The embedder retains
+`ComponentLogRuntime` for as long as component logging is active and drains it after
+`DrasiLib::shutdown()` but before exporter and Tokio runtime teardown.
 
 ### Alternatives Considered
 

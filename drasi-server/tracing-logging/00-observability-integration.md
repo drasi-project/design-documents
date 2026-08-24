@@ -227,11 +227,11 @@ Availability of individual metrics varies by platform (e.g., `process_open_fds` 
 1. Load config (existing)
 2. Resolve the telemetry profile once — TelemetryProfile::resolve() yields         (NEW)
    trace_directives + metric_filters + collection; all three must be consumed
-3. init_component_log_layer() — create the ComponentLogRegistry + `ComponentLogLayer`
-   (CHANGED: get_or_init_global_registry() is removed; this installs nothing)
+3. init_component_logging() — create and retain `ComponentLogRuntime`, including the
+   ComponentLogRegistry, bounded sender, worker, composable layer and shutdown/drain handle
+   (CHANGED: get_or_init_global_registry() is removed; this installs nothing globally)
 4. Build and install tracing subscriber — EnvFilter(trace_directives) +            (NEW)
-   `ComponentLogLayer` + fmt + optional OTLP, composed into one Registry
-   (drasi-lib's log worker thread starts here, on Dispatch construction)
+   `component_logs.layer()` + fmt + optional OTLP, composed into one Registry
 5. Build the selected metrics backend, wrap its recorder in                     (NEW)
   FilterLayer(metric_filters), and install it globally. Retain either the
   PrometheusHandle or the OTLP SdkMeterProvider.
@@ -259,13 +259,14 @@ The required sequence, and the ordering is load-bearing:
 |---|---|
 | 1. Await **either** `SIGINT` or `SIGTERM` | `ctrl_c()` alone is a developer-laptop path |
 | 2. `DrasiLib::shutdown()` | Component-stop logs and final metric values must be *recorded* first |
-| 3. Flush telemetry — tracer provider `shutdown()`/`force_flush()`, metrics provider on the OTLP branch | Flushing before step 2 discards exactly the shutdown diagnostics you wanted |
-| 4. Tear down the tokio runtime | Dropping it before the flush completes loses what the flush was for |
-| 5. Bound step 3 with the export timeout | A dead collector must not hang termination past the orchestrator's grace period — after which `SIGKILL` makes it moot anyway |
+| 3. Drain and stop `ComponentLogRuntime` | The retained bounded sender and worker must finish after component-stop logs are recorded and before their runtime disappears |
+| 4. Flush telemetry — tracer provider `shutdown()`/`force_flush()`, metrics provider on the OTLP branch | Flushing before steps 2–3 discards exactly the shutdown diagnostics you wanted |
+| 5. Tear down the tokio runtime | Dropping it before the drain and flush complete loses what they were for |
+| 6. Bound steps 3–4 with the export timeout | A dead worker or collector must not hang termination past the orchestrator's grace period — after which `SIGKILL` makes it moot anyway |
 
 Under the Prometheus **scrape** branch there is no metrics flush to perform at all: the scrape reads
-current values, so metrics have no unexported window. Steps 3–5 concern traces, and logs if an OTLP
-log layer is composed.
+current values, so metrics have no unexported window. Steps 3–6 concern component logs, traces, and
+logs if an OTLP log layer is composed.
 
 ### API Design
 
@@ -412,7 +413,7 @@ text, and spans arrive at a mock OTLP receiver.
 | 1a. Profile wiring | Resolve `TelemetryProfile` once at startup and apply all three outputs: directives, filters, and collection flags |
 | 2. Dependencies | Add `tracing-opentelemetry`, `opentelemetry-otlp`, `opentelemetry_sdk`, `metrics`, `metrics-util`, `metrics-exporter-prometheus`, `metrics-exporter-otel`, `metrics-process` to `Cargo.toml` |
 | 3. Builder API | Add `.with_telemetry_profile()`, `.with_tracing_endpoint()`, `.with_tracing_service_name()`, `.with_metrics_prometheus()`, `.with_metrics_otlp()`, `.with_process_metrics()` to `DrasiServerBuilder` |
-| 4. Tracing setup | Implement `init_tracing()` — compose Registry with EnvFilter + fmt + ComponentLogLayer + optional OTLP. Depends on the drasi-lib `init_component_log_layer()` split |
+| 4. Tracing setup | Implement `init_tracing()` — retain `ComponentLogRuntime` and compose Registry with EnvFilter + fmt + its `ComponentLogLayer` + optional OTLP. Depends on the drasi-lib `init_component_logging()` split |
 | 5. Metrics setup | Implement `init_metrics()` with `PrometheusRecorder` + retained `PrometheusHandle`, or `OpenTelemetryRecorder` + retained `SdkMeterProvider`; wrap the selected recorder in `FilterLayer` and mount `/metrics` for Prometheus |
 | 5a. Process metrics | Install `metrics-process` `Collector` when `processMetrics` is enabled; wire `collect()` into the `/metrics` handler and/or the OTLP push interval |
 | 6. `init` CLI | Extend `drasi-server init` with telemetry prompts (profile, OTLP endpoint, service name, metrics backend, process metrics) |

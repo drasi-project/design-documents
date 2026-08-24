@@ -223,6 +223,9 @@ follow the convention in
 [§9](#9-naming-and-namespacing-conventions): dot-namespaced OpenTelemetry names, with instrument
 type and unit recorded as metadata rather than encoded in the name.
 
+`drasi.query.engine.duration` is recorded around the shared inner evaluation boundary for bootstrap,
+live changes, and due futures, not around their different outer entry-point functions.
+
 Notes:
 
 - **`drasi.queue.drops` is the most important metric in this document.** Dropping events at
