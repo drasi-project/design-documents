@@ -222,7 +222,7 @@ Runtime dependencies must be checked against accepted identities and current aut
 
 The UI must not fetch full configurations to render summaries or treat hidden buttons as enforcement. UI affordances may reflect effective permissions, but the server remains authoritative.
 
-Authentication failures/unavailability follow [01](01-authentication.md). Authorization denial is `403` for a visible target and `404` for a hidden or missing target. Global/scoped actions without a hidden target may return `403`. Errors and validation failures must not disclose protected configuration, hidden dependencies, or credentials.
+Authentication failures/unavailability follow the [authentication failure contract](01-authentication.md#http-surface-and-failure-contract): `401` for missing, malformed, expired, or invalid credentials; `503` when verification is temporarily unavailable and no usable trusted keys remain. Verification unavailability is not an authorization denial or proof that a credential is invalid. Authorization denial is `403` for a visible target and `404` for a hidden or missing target. Global/scoped actions without a hidden target may return `403`. Errors and validation failures must not disclose protected configuration, hidden dependencies, or credentials.
 
 ## Audit and security dependencies
 
