@@ -1,8 +1,12 @@
 # Drasi Server Audit
 
+* Project Drasi - 2026-10-19 - Aman Singh (@amansinghoriginal)
+
 **Status:** Draft
 
 ## Overview
+
+<!-- Provide a succinct high-level description of the component or feature and where/how it fits in the big picture. The overview should be one to three paragraphs long and should be understandable by someone outside Drasi team. -->
 
 V1 starts with a simple local audit file and explicit operation outcomes. We will expand this approach when justified by user demand, rather than introduce additional audit infrastructure in anticipation of it. Backward compatibility, user migration, and data migration are not requirements.
 
@@ -10,7 +14,65 @@ Drasi Server will record who attempted security-sensitive operations, which reso
 
 This design defines target behavior, not the current implementation. It completes the shared audit contract referenced by the other control-plane designs without adding roles, an audit-query API, or a second authority store.
 
-## Scope and dependencies
+## Terms and definitions
+
+<!-- These terms are internal to your design and will not be shared publicly. -->
+
+| Term | Definition |
+|---|---|
+| Audit record | A bounded structured description of an operation, decision, outcome, or security-relevant transition |
+| Audit-required operation | An operation whose record must be written under the coverage and ordering rules below |
+| Write acknowledgement | Confirmation that a complete record was written to the local file, not merely queued or accepted by a logger |
+| Known audit outage | The audit facility cannot currently provide that acknowledgement within its supported bounds |
+| Correlation | Host-established identifiers linking an operation, its constituent changes, and later outcomes; not authentication or authority |
+
+## Objectives
+
+<!-- Describes goals/non-goals and user-scenario of this feature to understand the end-user goals.
+
+- If the feature shares the same objectives of the existing design, link the existing doc rather than repeat the same context.
+- If the feature has a scenario, UX, or other product feature design doc, link it here and summarize the important parts. -->
+
+### User scenarios
+
+<!-- Describe the user scenarios for this design. Ensure that you define the roles and personas in these user scenarios when it requires API design. -->
+
+- A component Owner or scoped administrator changes accepted configuration and can distinguish a rejected change from one committed with incomplete runtime or audit completion.
+- An authorized reader requests results or a configuration export; Drasi records admission before releasing protected data.
+- A host administrator configures local audit storage and performs initialization or access recovery with host-attributed evidence.
+- During an audit-only outage, authorized callers can still Stop components or revoke permission, while existing authorized pipelines remain subject to normal security checks.
+
+### Goals
+
+<!-- Describes goals to define why we need, where we go, and how we know whether we will be successful when we deliver this feature. -->
+
+- Record bounded, correctly attributed security evidence independently of ordinary logging.
+- Define honest local-write acknowledgement, operation outcomes, and audit-outage behavior.
+- Preserve credential and data confidentiality without introducing another authority store.
+
+### Non-Goals
+
+<!-- Describe non-goals to identity something that we won't be focusing on immediately. We won't be expending any effort on these matters. -->
+
+No new audit-reader role, audit database, mandatory per-record durable flush, persistent outbox, remote delivery guarantee, cryptographic history chain, or processing-recovery mechanism is required.
+
+## Design requirements
+
+<!-- Describe key technical requirements, dependencies, and constraints that impact the design.
+
+Provide a link to the issue(s) tracking this work. -->
+
+Design review: [Control-plane audit, PR #22](https://github.com/drasi-project/design-documents/pull/22).
+
+### Requirements
+
+<!-- List design goals or constraints that impact the design. Examples include extensibility points, maintainability, code reuse, considering if your feature needs to be taken down-level and coherency with related code. -->
+
+The contract applies to Server-managed API, runtime, and host-administration operations. SDK integrations must carry the context needed by those operations; ordinary embedded DrasiLib applications are not required to adopt Server auditing.
+
+### Dependencies
+
+<!-- Describe the key dependencies that this design has on other features being developed as well as the dependencies other features have on this design. For example, supporting AWS resource has multiple feature dependencies with Bicep types, UCP, CoreRP, LinkRP, and CLI. This section summarizes such dependencies with the design document links. -->
 
 | Concern | Owning contract |
 |---|---|
@@ -21,21 +83,27 @@ This design defines target behavior, not the current implementation. It complete
 | Export, template deployment, and constituent Apply mutations | [Templates and portability](05-templates-and-portability.md) |
 | Audit coverage, local recording, acknowledgement, and audit availability | This design |
 
-The contract applies to Server-managed API, runtime, and host-administration operations. SDK integrations must carry the context needed by those operations; ordinary embedded DrasiLib applications are not required to adopt Server auditing.
+### Out of scope
+
+<!-- Describe the important issues or concerns NOT addressed by this proposal. 1 paragraph each (can be short). Often the "out of scope" items refer to the current state. We might already have planned work to address the "out of scope" items, mention it if that's the case. -->
 
 Other security planes define their own operations and integrate with this audit contract where required. This document does not decide native plugin admission, listener authentication methods, delivery semantics, or processing recovery.
 
-## Terms and responsibility
+## Design
 
-| Term | Meaning |
-|---|---|
-| Audit record | A bounded structured description of an operation, decision, outcome, or security-relevant transition |
-| Audit-required operation | An operation whose record must be written under the coverage and ordering rules below |
-| Write acknowledgement | Confirmation that a complete record was written to the local file, not merely queued or accepted by a logger |
-| Known audit outage | The audit facility cannot currently provide that acknowledgement within its supported bounds |
-| Correlation | Host-established identifiers linking an operation, its constituent changes, and later outcomes; not authentication or authority |
+### High-level design
+
+<!-- Provide a high-level description, using diagrams as appropriate, and top-level explanations to convey the architectural/design overview. Don't go into a lot of details yet but provide enough information so that the relationship between these components and other components. Call out or highlight new components that are not part of this feature (dependencies). This diagram generally treats the components as black boxes. Provide a pointer to a more detailed design document, if one exists. If you have the alternatives for your design, describe alternative solution too. -->
 
 Drasi Server owns one audit facility per deployment. Its operation-facing interface must report successful recording or failure. It must be independent of `RUST_LOG`, component log levels, optional processing storage, and whether anyone subscribes to diagnostics.
+
+Produce records where the security decision and operation outcome are known. Do not reconstruct them from HTTP status codes, arbitrary log messages, or lifecycle broadcasts. A failed HTTP request may already have committed a change; a runtime status change does not identify the person who requested it.
+
+Host initialization and offline access recovery use the same record and file contract under 04's exclusive deployment access. This is shared code, not a requirement to run a separate audit service. The audit writer does not acquire authority to perform the operation it describes.
+
+### Architecture Diagram
+
+<!-- Provide an architecture design if applicable. An architecture diagram should be provided when the design involves multiple parts of Drasi (Communication between RPs, Communication between CLI and RPs, Protocol changes for UCP, Communication with external systems like clouds, etc.) -->
 
 ```text
 Authenticated API operations     Host maintenance     Managed runtime/security hooks
@@ -50,11 +118,20 @@ Authenticated API operations     Host maintenance     Managed runtime/security h
                     Optional host collector  Admission and readiness
 ```
 
-Produce records where the security decision and operation outcome are known. Do not reconstruct them from HTTP status codes, arbitrary log messages, or lifecycle broadcasts. A failed HTTP request may already have committed a change; a runtime status change does not identify the person who requested it.
+### Detail design
 
-Host initialization and offline access recovery use the same record and file contract under 04's exclusive deployment access. This is shared code, not a requirement to run a separate audit service. The audit writer does not acquire authority to perform the operation it describes.
+<!-- This section should be detailed and through enough that another developer could implement your design and provide enough detail to get a high confidence estimate of the cost to implement the feature but isn't as detailed as the code. Be sure to also consider testability in your design.
 
-## Host configuration and local file
+For each change, give each "change" in the proposal its own section and describe it in enough detail that someone else could implement it. Cover ALL of the important decisions like names. Your goal is to get agreement to proceed with coding and PRs.
+
+If there are alternative you are considering please include that in the open questions section.
+
+If the product has a layered architecture, it's good to align these sections with the product's layers. This will help readers use their current understanding to understand your ideas.
+
+- **Advantages of this design** - Describe what's good about this plan relative to other options. Does it feel easy to implement? Provide flexibility for future work?
+- **Disadvantages** - Describe what's not ideal about this plan. If you don't point these things out other people will do it for you. This is a good place to cover risks. -->
+
+#### Host configuration and local file
 
 The host may configure an audit-file path through the startup-setting contract in 04. The setting is optional; auditing is not. It applies to Server-managed production and private development deployments.
 
@@ -79,7 +156,7 @@ Write structured, newline-delimited JSON records with safe encoding and bounded 
 
 The host protects the directory and files and manages capacity, rotation, retention, and optional collection. Rotation/reopening must preserve the append and acknowledgement contract; an unavailable writer follows the same outage rules. Existing history is not silently deleted when the configured path changes.
 
-### What acknowledgement guarantees
+##### What acknowledgement guarantees
 
 A complete record must reach the local file through a successful write before it is acknowledged. Acceptance into a memory queue, a tracing call, or a userspace buffer alone is insufficient. Internal asynchronous writing is allowed if the operation receives the actual write outcome.
 
@@ -87,9 +164,11 @@ V1 does not require a durable flush for each record. A host/power failure may lo
 
 Write failures, partial writes, and exceeded writer bounds must not be acknowledged as successful audit. Bound pending records, bytes, and write-wait time; required records cannot be silently dropped to keep the facility looking healthy.
 
+Before appending another record after a partial or interrupted write, the serialized writer must establish a line boundary. If the existing tail is not newline-terminated, append a delimiter without overwriting or truncating the damaged bytes. That delimiter does not complete or acknowledge the damaged record. Subsequent records, including startup and recovery records, must be independently readable, newline-terminated JSON records. If the boundary or the new record cannot be written, do not acknowledge recovery or reopen admission.
+
 The local file remains useful after component deletion. Runtime cleanup must not remove its audit history. It is not tamper-proof against an administrator or native code that controls the host.
 
-## Audit coverage
+#### Audit coverage
 
 Record semantic operations rather than every internal function call. The following table defines required coverage; it does not grant permission to perform any operation.
 
@@ -116,7 +195,7 @@ For automatic work, record security-relevant transitions rather than repeatedly 
 
 An internal helper created to serve a Query read remains part of that read's scope and lifetime under 02. Do not turn it into an apparent user-created/owned Reaction in audit.
 
-## Record content and attribution
+#### Record content and attribution
 
 Use a defined structured envelope, not arbitrary dictionaries copied from requests or plugins. Exact wire names are implementation choices; these meanings must be available:
 
@@ -148,9 +227,9 @@ Never record tokens, authorization codes, PKCE verifiers, passwords, resolved Se
 
 Audit is host-protected evidence, not another component discovery feed. Its records must not be exposed through component logs/events or generic diagnostic APIs. A Log Reaction's intentional result output is likewise not audit.
 
-## Operation ordering and completion
+#### Operation ordering and completion
 
-### Mutations and composite work
+##### Mutations and composite work
 
 Use the authorization and commit boundary from 02/04. Check audit availability before admitting new audit-required work. A healthy check is not a reservation that guarantees a later write.
 
@@ -160,7 +239,7 @@ If the audit write fails after commitment, preserve the committed state and repo
 
 For Apply, follow 05's per-entry commitment and stop-on-failure contract. Each constituent operation needs its own target/outcome evidence; a top-level success/failure record alone is insufficient. Use correlation to connect the entries, without recording the bundle or template parameter values.
 
-### Reads, denials, and sessions
+##### Reads, denials, and sessions
 
 For an authorized sensitive read/export or protected session opening, write its admission record before releasing protected data. If that write fails, do not release the response, cached results, or initial stream data. Recheck current authority as required by 02; a written audit record does not reserve access after revocation.
 
@@ -172,7 +251,7 @@ Close protected access on expiration, revocation, disconnect, or lost eligibilit
 
 Automatic enforcement of lost authority must likewise proceed even if its audit record cannot be written. Recording failure cannot delay security-driven blocking or turn withdrawn permission back into usable authority.
 
-## Audit availability and recovery
+#### Audit availability and recovery
 
 This is an audit-only outage policy: it never relaxes authentication, authorization, credential, or control-store requirements.
 
@@ -195,7 +274,7 @@ Use bounded failure reporting and recovery attempts. A pathname existing or a su
 
 No persistent audit replay queue, retrospective reconstruction from control state, or additional acknowledgement from a remote collector is required. Graceful shutdown should finish bounded pending writes; forced termination is subject to the stated incomplete-history limit.
 
-## Bounded failure recording
+#### Bounded failure recording
 
 Unauthenticated callers can generate unlimited missing/invalid-token requests. Retain bounded individual detail and explicit aggregate counts for repeated unauthenticated failures. Aggregates must identify the safe failure category and covered time interval; aggregation must not silently claim each attempt has an individual record.
 
@@ -205,13 +284,41 @@ Do not sample accepted sensitive operations, binding mutations, authenticated ad
 
 Counters and pending summaries need not survive a crash. If the sink is unavailable, bounded health/operational reporting must reveal the loss rather than silently present a complete history. Numeric limits, aggregation windows, backpressure, and scheduling are implementation choices.
 
-## External collection and future destinations
+#### External collection and future destinations
 
 An operator-managed collector may forward the local file to a remote service. Drasi acknowledges the local write only; successful local audit does not prove collection, remote delivery, indexing, or retention. A collector outage alone is not an audit-writer outage.
 
 Keep record generation separate from writing so a later direct remote destination can be considered without redefining every audited operation. V1 does not add remote sink configuration, a public sink-plugin framework, credential provisioning for a collector, or a delivery subsystem. Direct remote acknowledgement, buffering, and outage behavior would require an explicit later decision.
 
-## Threats, risks, and decisions
+### API Design
+
+<!-- Include if applicable -- any design that changes our public REST API, CLI arguments/commands, or Go APIs for shared components should provide this section. Write N/A here if not applicable.
+
+- Describe the REST APIs in detail for new resource types or updates to existing resource types. E.g. API Path and Sample request and response.
+- Describe new commands in the CLI or changes to existing CLI commands.
+- Describe the new or modified Go APIs for any shared components. -->
+
+This design adds no audit REST endpoint or user-facing audit CLI command. Existing Server and host-administration operations must apply the following admission and completion behavior.
+
+| Surface | Required contract |
+|---|---|
+| Existing mutation responses and host-command outcomes | Preserve [04's commitment/completion distinctions](04-security-state-and-administration.md#completion-and-audit), including explicit post-commit audit failure; do not report rollback |
+| Sensitive reads, exports, and protected session admission | Acknowledge the admission record before releasing protected data; an existing audit record does not replace current authorization |
+| Readiness and authorized management inspection | Report aggregate readiness and permitted safe audit-health details; do not expose the file or record contents |
+| Host startup configuration | Use the optional audit path and mandatory-audit behavior defined in [Host configuration and local file](#host-configuration-and-local-file) |
+| Internal operation/runtime integration | Supply trusted semantic context to the shared facility and receive the actual write result and availability state, not a fire-and-forget logging acknowledgement |
+
+Rust interfaces, SDK/FFI plumbing, record field spelling, and error serialization remain implementation choices. The Server, clients, and host tooling must use a consistent contract without requiring another design of permissions.
+
+### Alternatives Considered
+
+<!-- Describe the alternative designs that were considered or should be considered. Give a justification for why alternative approaches should be rejected if possible. -->
+
+Scraping logs or lifecycle events loses actor and commit semantics and inherits best-effort filtering/drop behavior. Writing through a Reaction would make the evidence depend on the workload being audited. An audit database/outbox or atomic state-and-audit transaction adds durability guarantees not selected here. Requiring remote acknowledgement would couple administration to a separate service and delivery policy. Unconditionally continuing new sensitive work during failure defeats required audit; stopping all work would unnecessarily interrupt previously authorized pipelines and containment.
+
+## Security
+
+<!-- Optional. Use this section to describe the security threats and its mitigations with this design---such as authenticating request, storing secrets and credentials, etc. -->
 
 | Threat / risk | Simplified example | What is at risk | Mitigation or accepted limit |
 |---|---|---|---|
@@ -226,11 +333,27 @@ Keep record generation separate from writing so a later direct remote destinatio
 | Audit itself becomes a disclosure endpoint | Component log subscribers receive deployment-wide audit records | Cross-resource identity or operation disclosure | Host-protected file, separate from logs/diagnostics; no audit-query API |
 | Attacker exhausts audit capacity | Repeated invalid tokens fill queues or disk | Control-plane availability | Bounded detail and explicit unauthenticated-failure aggregates; writer failure is visible |
 | Local acknowledgement is overstated | Power fails after an OS write but before durable storage | Lost audit tail | Accepted: no per-record crash durability or atomic state-and-audit guarantee |
-| False recovery reopens admission | File exists but writes still fail | New unaudited sensitive work | Require successful recovery recording before reopening admission |
+| False recovery reopens admission | File exists but writes fail, or a new record joins an unterminated fragment | New unaudited sensitive work | Establish a line boundary and require an independently readable recovery record before reopening admission |
 | Host or native code alters audit | Privileged code deletes or rewrites the file | Incomplete or falsified history | OS/deployment protection; accepted trusted-host limit, no tamper-proof claim |
 | Remote collection is mistaken for guaranteed delivery | Local writes succeed while a collector is disconnected | Missing remote evidence | Explicit local-only acknowledgement; collection/retention remain operator responsibilities |
 
-## Verification and implementation boundaries
+## Compatibility impact
+
+<!-- Optional. Describe the potential compatibility issues with the other components---such as incompatible with older CLI. Include breaking changes to behaviors or APIs here. -->
+
+Backward compatibility, user migration, and data migration are not requirements. Server, client, and host-tool changes must consistently implement the operation outcomes described above.
+
+## Supportability
+
+### Telemetry
+
+<!-- This includes the list of instrumentation such as metric, log, and trace to diagnose this new feature. -->
+
+Use the bounded health reporting, failure counts, and recovery recording defined in [Audit availability and recovery](#audit-availability-and-recovery) and [Bounded failure recording](#bounded-failure-recording). Operational telemetry remains separate from required audit and must not expose credentials, raw errors, or protected payloads.
+
+### Verification
+
+<!-- This includes the test plan to validate the features such as unit-test and functional tests. -->
 
 | Case | Required result |
 |---|---|
@@ -245,19 +368,36 @@ Keep record generation separate from writing so a later direct remote destinatio
 | Partial Apply with a constituent audit failure | Correlated per-entry records and 05's honest partial completion; later entries not admitted |
 | Authentication flood and writer saturation | Bounded work, visible aggregation/loss, no sampling of protected mutation outcomes |
 | Partial writes, blocked writer, rotation, shutdown, and recovery | No false acknowledgement; degraded readiness and bounded recovery; no invented crash-completeness |
+| Unterminated tail followed by another record, startup, or reopening | Preserve the damaged bytes, establish a line boundary, and write an independently readable subsequent record; boundary/write failure must not reopen admission |
 | Nested secrets, error strings, multiline identifiers, and diagnostic streams | No credential/payload leakage, record injection, or unintended audit exposure |
+
+## Development Plan
+
+<!-- This section is for planning how you will deliver your features. This includes aligning work items to features, scenarios or requirements, defining what deliverable will be checked in at each point in the product and estimating the cost of each work item. Don't forget to include the Unit Test and functional test in your estimates. -->
 
 Current Server shared handlers, authentication/authorization context, the new control-state boundary, host CLI, and Server-managed runtime/SDK hooks are integration points. DrasiLib's `ComponentLogRegistry` and `ComponentEventHistory` provide operational streams, not authoritative security evidence. Their filtering, bounded retention, and fire-and-forget callbacks must not be repurposed as the required audit sink.
 
-Implement the shared writer/availability contract, integrate semantic operation and session boundaries, and exercise the failure matrix. Rust interfaces, SDK/FFI plumbing, record field spelling, error serialization, file-opening/rotation integration, and numeric limits remain implementation choices. The Server, clients, and host tooling must use a consistent contract without requiring another design of permissions.
+| Work item | Deliverable and verification |
+|---|---|
+| Shared writer and availability | Implement bounded encoding, serialized append, acknowledgement, outage/recovery, and framing; unit-test write failure, saturation, and interrupted tails |
+| Semantic operation integration | Connect API, host, runtime, and session boundaries to the shared facility; test attribution, admission ordering, and committed-but-incomplete outcomes |
+| Deployment and client integration | Wire startup configuration, readiness, permitted inspection/containment, and caller-visible outcomes; exercise the cross-component failure matrix above |
 
-No new audit-reader role, audit database, mandatory per-record durable flush, persistent outbox, remote delivery guarantee, cryptographic history chain, or processing-recovery mechanism is required.
+## Open issues
 
-## Alternatives considered
+<!-- Describe (Q&A format) the important unknowns or things you're not sure about. Use the discussion of to answer these with experts after people digest the overall design. -->
 
-Scraping logs or lifecycle events loses actor and commit semantics and inherits best-effort filtering/drop behavior. Writing through a Reaction would make the evidence depend on the workload being audited. An audit database/outbox or atomic state-and-audit transaction adds durability guarantees not selected here. Requiring remote acknowledgement would couple administration to a separate service and delivery policy. Unconditionally continuing new sensitive work during failure defeats required audit; stopping all work would unnecessarily interrupt previously authorized pipelines and containment.
+**Which details remain for implementation?** Rust/SDK interfaces, record field names, error serialization, file-opening/rotation integration, and numeric bounds remain implementation choices within this contract. They must not introduce new permissions, stronger durability promises, or remote-delivery requirements implicitly.
+
+## Appendices
+
+<!-- Optional. Describe additional information supporting this design. For instance, describe the details of alternative design if you have one. -->
+
+None.
 
 ## References
+
+<!-- Optional. Add the design documents and references you use for this document. -->
 
 - [Drasi Server](https://github.com/drasi-project/drasi-server)
 - [DrasiLib](https://github.com/drasi-project/drasi-core/tree/main/lib)
