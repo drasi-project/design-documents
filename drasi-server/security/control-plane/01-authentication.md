@@ -17,9 +17,11 @@ Backward compatibility and migration are not requirements.
 | Caller authentication | Server-owned token validation and authenticated caller context |
 | Permissions and continuing data access | Roles and permissions design; authentication alone grants no resource access |
 | Source/Reaction workload credentials | Instance credential design; existing `IdentityProvider::get_credentials()` supplies outbound credentials, not caller identity |
-| Component listeners, webhook proofs, and protocol-specific guards | Ingress design, using the shared host authority rather than independent plugin login systems |
+| Component listeners, webhook proofs, and protocol-specific guards | Outside this document; integration must use the shared host authority rather than independent plugin login systems |
 | Native code admission and loading | Separate Code & Plugin Plane |
 | Initialization, access recovery, and full development-mode lifecycle | Control-plane administration design |
+
+Listener, webhook-verification, and protocol-specific integration are outside this document's scope. These concerns will be addressed in a separate ingress/egress design, outside the control-plane scope.
 
 Ordinary embedded DrasiLib use does not require OIDC login. SDK interfaces connect endpoints to host authority; they must not create another identity system.
 
@@ -82,14 +84,14 @@ Explicit private development mode supplies a fixed Principal with Server Admin a
 
 Clients need no OIDC token, but cannot select this mode through requests or failed login. Localhost does not imply development mode. Validation, component scope, credential protections, and normal policy remain in effect.
 
-Audit identifies development identity explicitly. Administration and ingress define mode initialization/change and private exposure. This contract permits neither public fixed-administrator endpoints nor bypassing provider-webhook verification.
+Audit identifies development identity explicitly. Control-plane administration defines mode initialization/change; private listener exposure is outside this document's scope. This contract permits neither public fixed-administrator endpoints nor bypassing provider-webhook verification.
 
 | Client | Initial support |
 |---|---|
 | Admin UI | Production PKCE login/renewal and token-free private development access |
 | Scripts and service clients | Supply a suitable access token obtained through the configured provider's supported flow |
 | VS Code extension | Private development mode only; clearly report secured deployments as unsupported instead of repeatedly retrying unauthenticated requests |
-| Component applications | Follow the shared caller contract; protocol and browser integration are part of ingress work |
+| Component applications | Follow the shared caller contract; protocol and browser integration are outside this document's scope |
 
 Secured VS Code support is deferred, not a Server-side client-type ban. Later support can supply tokens to API, schema, and stream requests using this contract. No token-entry, login, renewal, or persistence feature is required initially.
 
