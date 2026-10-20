@@ -134,7 +134,7 @@ This table defines state effects, not another permission catalogue. Actors and p
 | Binding mutation | Commit the exact assignment/revocation consistently and apply its effect to current access; do not treat a copied permission cache as independent authority |
 | Provider mutation | Use saved dependencies, including stopped consumers, Secret-backed IDPs, and Source bootstrap references; preserve 03's distinct replacement, referenced-deletion, disable, and re-enable rules |
 | Start/stop | Commit the requested intent and then apply permitted runtime effects; Start requires current authority and credential availability. Stop is not a grant revocation |
-| Delete | Enforce target authority and saved-reference preconditions; retire identity and linked authority consistently. Do not implicitly delete another user's dependent resource or transfer authority to a replacement |
+| Delete | Enforce target authority. Reject component deletion while any saved component references the target, including Stopped or Blocked components; check committed references, not only runtime objects. Retire identity and linked authority consistently on deletion. Do not implicitly delete another user's dependent resource or transfer authority to a replacement |
 | Processing-state reset, if exposed | Preserve configuration, identity, ownership, bindings, and provider references. It is not a control-state reset or a new feature required by this design |
 
 Being Blocked is not equivalent to being explicitly Stopped for a configuration/provider change. Disabling a provider or losing Owner input authority can block execution while retaining Running intent. Re-enabling an unchanged provider or restoring qualifying authority may resume that intent; explicit Stopped intent remains Stopped.
@@ -235,6 +235,7 @@ V1 therefore has no workflow for adding, redefining, or removing host authentica
 | Restart after grants, intent, or provider availability change | Use current committed state; no old seed permissions or automatic activation of Stopped intent |
 | Seed substitutions versus host-enabled runtime discovery | Managed literals remain stable; runtime credentials follow 03 without being persisted |
 | Referenced provider replacement/deletion and stopped versus Blocked consumers | Apply saved-dependency and lifecycle rules even without runtime objects |
+| Component deletion with stopped, Blocked, or unconstructed saved consumers | Reject deletion using committed references; preserve the target and dependents until references are removed through authorized operations |
 | Offline access recovery and concurrent Server startup | Exclusive access, exact additive binding, host audit, preserved unrelated state |
 | Programmatic Server, aliases, composite operations, and internal read helpers | Same authority boundary; no persistence opt-out or accidental helper ownership/persistence |
 | Reset/cleanup and local Secret Store backends | No control-authority deletion or credential copying into control/processing state |
