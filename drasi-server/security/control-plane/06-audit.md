@@ -127,7 +127,7 @@ Use a defined structured envelope, not arbitrary dictionaries copied from reques
 | Actor | Actor kind and trusted identity/context as defined below |
 | Action and target | Semantic action, deployment, and relevant instance/component/provider UIDs and types when known |
 | Decision | Allowed, denied, or unavailable security decision, with a bounded safe reason |
-| Accepted state | Relevant accepted-state revision and whether a mutation committed; not applicable for operations that do not mutate |
+| Accepted state | Relevant accepted-state revisions where applicable; mutation commit status is not applicable to operations that do not mutate control state |
 | Completion | Actual operation/runtime outcome and failed phase; distinguish not attempted, pending, completed, and failed where applicable |
 | Binding-specific context | Fixed role and exact Principal/group selector for a binding operation |
 

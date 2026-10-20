@@ -172,9 +172,9 @@ Resolved passwords, tokens, authentication certificates, private keys, and Secre
 
 This does not prohibit intended Secret Store backends or protected host-provisioning facilities from holding their required values. Backend storage protection remains the operator's responsibility.
 
-Audit provider mutations, credential-reference changes, denials, and security-relevant availability transitions under the shared audit contract. Record the actual API actor, instance/profile/component identities, operation, relevant accepted-state revision, and outcome. Automatic work uses system/component attribution; host setup uses host attribution, never an invented OIDC caller.
+Audit provider mutations, credential-reference changes, denials, and security-relevant availability transitions under the shared [audit contract](06-audit.md). Record the actual API actor, instance/profile/component identities, operation, relevant accepted-state revision, and outcome. Automatic work uses system/component attribution; host setup uses host attribution, never an invented OIDC caller.
 
-Do not log credentials, full configuration/request bodies, or raw credential-provider responses. Diagnostics expose bounded safe reasons, not secrets. Existing audit-outage and containment rules in [02](02-roles-and-authorization.md#audit-and-security-dependencies) apply; this document does not add a new outage exemption for profile mutations.
+Do not log credentials, full configuration/request bodies, or raw credential-provider responses. Diagnostics expose bounded safe reasons, not secrets. Existing audit-outage and containment rules in [06](06-audit.md#audit-availability-and-recovery) apply; this document does not add a new outage exemption for profile mutations.
 
 ## Threats, risks, and decisions
 

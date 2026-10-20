@@ -18,7 +18,7 @@ This design defines state ownership, initialization, mutation and startup contra
 | Roles, permanent ownership, bindings, input `use`, visibility, and revocation | [Roles and authorization](02-roles-and-authorization.md) |
 | Host authentication options, instance providers, credential references, and provider lifecycle | [Instance credentials](03-instance-credentials.md) |
 | Durable authority, configuration sources, initialization, and host access recovery | This design |
-| Audit events and outage behavior | Apply the shared policy recorded in [02](02-roles-and-authorization.md#audit-and-security-dependencies); audit sink implementation is separate |
+| Audit coverage, recording, acknowledgement, and outage behavior | [Audit](06-audit.md) |
 | Native artifacts, listeners, delivery, and processing recovery | Separate Code & Plugin, ingress, egress, and processing designs |
 
 Server-managed execution must follow this contract across CLI startup, programmatic Server construction, default-instance aliases, and composite API operations. Ordinary embedded DrasiLib applications are not required to adopt Server administration or its control store.
@@ -153,9 +153,9 @@ These outcomes apply to each mutation. A composite operation must disclose any c
 
 A failed activation or audit write does not roll back a committed configuration or resurrect a revoked binding. Do not report a failed stop as a stopped runtime. After an interrupted or ambiguous response, callers must be able to inspect authorized accepted state before retrying; the response contract must distinguish commit outcome from activation outcome. Exact response fields remain implementation choices.
 
-Apply the audit-outage rules in 02, including its narrow Stop/revocation exceptions. Those exceptions do not permit uncommitted mutations when the control store cannot accept a change. Host OS process control remains available outside the API model; it does not persist a new component intent.
+Apply the audit-outage rules in [06](06-audit.md#audit-availability-and-recovery), including its narrow Stop/revocation exceptions. Those exceptions do not permit uncommitted mutations when the control store cannot accept a change. Host OS process control remains available outside the API model; it does not persist a new component intent.
 
-Audit uses the actual API actor, host identity for local maintenance, or system/component attribution for automatic work. An existing Owner is not impersonated by a reconciler. Audit storage and detailed outage/readiness implementation remain separately owned.
+Audit uses the actual API actor, host identity for local maintenance, or system/component attribution for automatic work. An existing Owner is not impersonated by a reconciler. Audit storage and detailed outage/readiness behavior are defined in [06](06-audit.md).
 
 ## Normal startup and runtime availability
 
@@ -165,7 +165,7 @@ Load saved resources independently of runtime activation. Establish the applicab
 
 An individual component or provider activation failure must preserve its accepted configuration and authorized management visibility. It must not, by itself, prevent the management API from operating or unrelated eligible work from running. A valid reference to an unavailable provider is different from a corrupt authority record.
 
-Authentication-service availability follows 01, including usable cached signing keys and fail-closed requests when verification is unavailable. It is not permission to erase state or stop pipelines merely because their creator cannot log in. Audit-only outages follow 02 rather than being treated as control-state corruption.
+Authentication-service availability follows 01, including usable cached signing keys and fail-closed requests when verification is unavailable. It is not permission to erase state or stop pipelines merely because their creator cannot log in. Audit-only outages follow [06](06-audit.md#audit-availability-and-recovery) rather than being treated as control-state corruption.
 
 Server shutdown and runtime errors must not rewrite Running intent, ownership, or grants. Restart rechecks current authority rather than trusting a prior Running status. This contract does not specify processing recovery, delivery guarantees, or retry algorithms.
 
@@ -191,7 +191,7 @@ Preserve existing administrator bindings, component Owners, resources, provider 
 
 Access recovery requires valid readable control state; it is not a corrupt-store repair tool. A broken host login configuration must be corrected through its host-controlled startup contract, not bypassed with an anonymous endpoint or default password. Recovery does not acquire or validate a live token on the target's behalf.
 
-The shared audit contract applies: recovery is not an additional audit-outage exemption for granting authority. If a grant commits and subsequent audit fails, report committed-but-incomplete accurately; do not imply that existing authority was reset.
+The shared [audit contract](06-audit.md) applies: recovery is not an additional audit-outage exemption for granting authority. If a grant commits and subsequent audit fails, report committed-but-incomplete accurately; do not imply that existing authority was reset.
 
 ## Deferred host maintenance
 

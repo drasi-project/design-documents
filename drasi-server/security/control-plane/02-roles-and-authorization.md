@@ -226,11 +226,11 @@ Authentication failures/unavailability follow [01](01-authentication.md). Author
 
 ## Audit and security dependencies
 
-Audit binding changes, component/profile mutations, denials, lifecycle actions, exports, sensitive data access, application mutations, and session/stream opening/closing under the shared audit contract. Include action, target identities, role/grantee for binding changes, relevant accepted-state revisions, and outcome. Attribute an edit to its actual caller, not the unchanged Owner. Automatic work uses system/component attribution; host operations use host identity.
+Audit binding changes, component/profile mutations, denials, lifecycle actions, exports, sensitive data access, application mutations, and session/stream opening/closing under the shared [audit contract](06-audit.md), which defines coverage, acknowledgement, and outage behavior. Include action, target identities, role/grantee for binding changes, relevant accepted-state revisions, and outcome. Attribute an edit to its actual caller, not the unchanged Owner. Automatic work uses system/component attribution; host operations use host identity.
 
 Never include resolved credentials, tokens, full request/configuration bodies, or protected payloads/results. No durable audit record per result row or delivery is required.
 
-During a known audit-only outage, block new audit-required operations; existing authorized pipelines may continue under normal checks. Authorized Stop and permission revocation remain available with explicit audit-failure reporting. A committed change whose audit write fails remains committed and is reported incomplete, not rolled back. Sink implementation and readiness reporting belong to the audit design.
+During a known audit-only outage, block new audit-required operations; existing authorized pipelines may continue under normal checks. Authorized Stop and permission revocation remain available with explicit audit-failure reporting. A committed change whose audit write fails remains committed and is reported incomplete, not rolled back. Sink implementation and readiness reporting belong to [06](06-audit.md).
 
 ## Threats, risks, and decisions
 
