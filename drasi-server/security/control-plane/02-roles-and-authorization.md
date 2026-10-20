@@ -16,10 +16,10 @@ This design defines the permissions, assignment rules, and enforcement behavior 
 |---|---|
 | Establish caller identity | [Authentication](01-authentication.md) supplies a validated Principal and credential lifetime; login alone grants no resource access |
 | Decide and enforce authority | This design governs Server requests, component sharing, and continuing runtime input access |
-| Persist resources and authority | Control-state design commits desired state, ownership, bindings, and dependency identities consistently; runtime is not the authority store |
-| Supply workload credentials | Instance credential design; credential availability is independent of component permissions |
-| Protect application listeners and delivery | Ingress/egress designs integrate with this authority; they do not create separate permission stores |
-| Admit native code and administer the host | Separate Code & Plugin Plane and host-administration contracts; API roles do not confer OS authority |
+| Persist resources and authority | The [control-state design](https://github.com/drasi-project/design-documents/pull/20) commits desired state, ownership, bindings, and dependency identities consistently; runtime is not the authority store |
+| Supply workload credentials | [Instance credential design](https://github.com/drasi-project/design-documents/pull/19); credential availability is independent of component permissions |
+| Protect application listeners and delivery | Listener transport and delivery behavior will be addressed in separate ingress/egress designs outside the control-plane scope; those integrations must use this authority, not separate permission stores |
+| Admit native code and administer the host | Native code admission belongs to the separate Code & Plugin Plane; [host administration](https://github.com/drasi-project/design-documents/pull/20) addresses deployment administration. API roles do not confer OS authority |
 
 Drasi Server owns the fixed policy and authoritative role bindings. DrasiLib and SDK integration carry the context and enforcement hooks required for Server-managed execution. Applications using DrasiLib directly are not required to adopt Server roles or OIDC.
 
@@ -90,7 +90,7 @@ Administrative permissions remain subject to resource type, scope, host restrict
 
 Author alone cannot edit or operate another user's component. Operator is not a troubleshooting role. There is no Viewer, Instance Viewer, Connection User, or assignable Owner role.
 
-**Ingress dependency:** this document retains the approved submission-only meaning of `ingest`. The pending ingress proposal broadens it to Source application reads and mutations. That requires an explicit amendment; an existing plugin's CRUD routes must not silently expand Source Ingestor authority.
+**Source ingestion scope:** `ingest` permits event submission only. Source application reads and general CRUD operations are not authorized by this permission; existing plugin routes must not silently expand Source Ingestor authority. Broader Source application access will be addressed in a separate ingress design outside the control-plane scope.
 
 ### Permanent ownership
 
@@ -135,7 +135,7 @@ Groups authorize current requests using validated claims and current bindings. T
 
 Source/Query `use` permits derivation and redistribution through authorized downstream components. Drasi does not propagate upstream row-level permissions, prevent external copying, or require additional upstream grants from downstream readers.
 
-Credential availability is separate: Authors and existing Source/Reaction Owners may exercise the shared instance credential authority under the credential design, but this does not grant access to another component. They may reproduce equivalent external data access through a different Source. Components, including those edited by Server Admin, select only their own instance's credential context.
+Credential availability is separate: Authors and existing Source/Reaction Owners may exercise the shared instance credential authority under the [instance credential design](https://github.com/drasi-project/design-documents/pull/19), but this does not grant access to another component. They may reproduce equivalent external data access through a different Source. Components, including those edited by Server Admin, select only their own instance's credential context.
 
 ## Operations and continuing access
 
@@ -174,7 +174,7 @@ Always evaluate effective authority: another applicable binding or ownership may
 | Caller loses Source `ingest` | Reject further submissions and close affected ingestion streams; do not stop the Source for others |
 | Caller loses visibility or Operator | Restrict/close affected summary subscriptions or deny further operations; losing Operator does not undo an earlier Start |
 | Owner loses last required input `use` | Block the affected consumer and dependent flow; retained results or subscriptions must not bypass the lost authority; leave unrelated bindings and shared credential profiles unchanged |
-| Credential profile becomes unavailable | Apply the credential design's acquisition and dependent-component restrictions; potentially affects multiple components |
+| Credential profile becomes unavailable | Apply the [instance credential design's](https://github.com/drasi-project/design-documents/pull/19) acquisition and dependent-component restrictions; potentially affects multiple components |
 | IdP-only group/account changes | Follow credential lifetime; fresh tokens supply current claims, not real-time IdP synchronization |
 
 Local binding changes affect active access even with an otherwise valid token. Protected streams end at credential expiration, including while idle. Loss of runtime authority preserves requested Running intent; valid restored authority may allow automatic resumption. Restart rechecks current authority.
@@ -227,11 +227,11 @@ Authentication failures/unavailability follow the [authentication failure contra
 
 ## Audit and security dependencies
 
-Audit binding changes, component/profile mutations, denials, lifecycle actions, exports, sensitive data access, application mutations, and session/stream opening/closing under the shared audit contract. Include action, target identities, role/grantee for binding changes, relevant accepted-state revisions, and outcome. Attribute an edit to its actual caller, not the unchanged Owner. Automatic work uses system/component attribution; host operations use host identity.
+Audit binding changes, component/profile mutations, denials, lifecycle actions, exports, sensitive data access, application mutations, and session/stream opening/closing under the shared [audit contract](https://github.com/drasi-project/design-documents/pull/22). Include action, target identities, role/grantee for binding changes, relevant accepted-state revisions, and outcome. Attribute an edit to its actual caller, not the unchanged Owner. Automatic work uses system/component attribution; host operations use host identity.
 
 Never include resolved credentials, tokens, full request/configuration bodies, or protected payloads/results. No durable audit record per result row or delivery is required.
 
-During a known audit-only outage, block new audit-required operations; existing authorized pipelines may continue under normal checks. Authorized Stop and permission revocation remain available with explicit audit-failure reporting. A committed change whose audit write fails remains committed and is reported incomplete, not rolled back. Sink implementation and readiness reporting belong to the audit design.
+During a known audit-only outage, block new audit-required operations; existing authorized pipelines may continue under normal checks. Authorized Stop and permission revocation remain available with explicit audit-failure reporting. A committed change whose audit write fails remains committed and is reported incomplete, not rolled back. Sink implementation and readiness reporting belong to the [audit design](https://github.com/drasi-project/design-documents/pull/22).
 
 ## Threats, risks, and decisions
 
@@ -283,5 +283,8 @@ Individually assigned actions or custom policies create a second configuration s
 ## References
 
 - [Drasi Server authentication](01-authentication.md)
+- [Drasi Server instance credentials](https://github.com/drasi-project/design-documents/pull/19)
+- [Drasi Server security state and administration](https://github.com/drasi-project/design-documents/pull/20)
+- [Drasi Server audit](https://github.com/drasi-project/design-documents/pull/22)
 - [Drasi Server](https://github.com/drasi-project/drasi-server)
 - [DrasiLib](https://github.com/drasi-project/drasi-core/tree/main/lib)
