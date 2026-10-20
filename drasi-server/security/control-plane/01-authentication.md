@@ -108,7 +108,107 @@ Protected routes are the default. Public exceptions must be explicit and contain
 | Management APIs, configuration, plugin inventory/schemas, diagnostics, and results | Authenticated, followed by the applicable authorization checks |
 | OpenAPI and Swagger functionality | Authenticated; data-free static assets may be public, but schema access and interactive API calls must use the same authenticated client flow |
 
-Both authentication endpoints have no request body; JSON names follow existing API conventions. Development bootstrap reports its mode, not invented OIDC settings; its `whoami` identifies the development Principal without token expiration.
+Both authentication endpoints have no request body. Successful responses use HTTP `200`, `application/json`, and the existing `ApiResponse` envelope: `success: true`, a `data` object, and `error: null`. The data fields below use camelCase. Failure responses use the existing `ErrorResponse` shape and the status rules below, not a successful response envelope.
+
+### Authentication bootstrap response
+
+`GET /api/v1/auth/config` returns:
+
+| Data field | Type | Contract |
+|---|---|---|
+| `mode` | `"production"` or `"development"` | The deployment's selected mode; not a client-selectable setting |
+| `oidc` | Object or `null` | Required object in production; explicitly `null` in development |
+| `oidc.issuer` | String | Configured HTTPS issuer |
+| `oidc.audience` | String | Configured Drasi API audience |
+| `oidc.clientId` | String or `null` | Browser public client ID; `null` when the Admin UI is disabled |
+| `oidc.callbackUrl` | String or `null` | Registered browser callback; `null` when the Admin UI is disabled |
+| `oidc.scopes` | Array of strings | Requested browser-login/API scopes; `[]` when the Admin UI is disabled |
+
+Production example with the Admin UI enabled:
+
+```json
+{
+  "success": true,
+  "data": {
+    "mode": "production",
+    "oidc": {
+      "issuer": "https://login.example.com",
+      "audience": "drasi-api",
+      "clientId": "drasi-admin-ui",
+      "callbackUrl": "https://drasi.example.com/ui/callback",
+      "scopes": ["openid", "drasi-api"]
+    }
+  },
+  "error": null
+}
+```
+
+The example's identifiers, callback, and scopes are illustrative host-configured values, not built-in defaults. Production without the Admin UI still returns its issuer and audience, with `clientId: null`, `callbackUrl: null`, and `scopes: []`.
+
+Development example:
+
+```json
+{
+  "success": true,
+  "data": {
+    "mode": "development",
+    "oidc": null
+  },
+  "error": null
+}
+```
+
+The `oidc` field is not omitted, and development must not invent an issuer or other OIDC settings.
+
+### Caller identity response
+
+`GET /api/v1/whoami` returns:
+
+| Data field | Type | Contract |
+|---|---|---|
+| `principal` | Object | The normalized caller identity, not a token or list of role bindings |
+| `principal.issuer` | String | Exact validated issuer, or the fixed development Principal's issuer label |
+| `principal.subject` | String | Exact validated subject, or the fixed development Principal's subject |
+| `principal.groups` | Array of strings | Normalized configured group values; `[]` when there are none |
+| `expiresAt` | RFC 3339 UTC string or `null` | Validated access-token expiration in production; explicitly `null` in development |
+
+Production example:
+
+```json
+{
+  "success": true,
+  "data": {
+    "principal": {
+      "issuer": "https://login.example.com",
+      "subject": "user-123",
+      "groups": ["analysts"]
+    },
+    "expiresAt": "2030-01-01T12:00:00Z"
+  },
+  "error": null
+}
+```
+
+Development example:
+
+```json
+{
+  "success": true,
+  "data": {
+    "principal": {
+      "issuer": "urn:drasi:development",
+      "subject": "server-admin",
+      "groups": []
+    },
+    "expiresAt": null
+  },
+  "error": null
+}
+```
+
+The development issuer/subject above illustrate the implementation's fixed identity, not an OIDC provider or caller-supplied identity. The response must match the Principal actually used by authorization and remain stable across restarts. `groups` and `expiresAt` are always present; no token expiration is fabricated for development.
+
+### Failures and access termination
 
 | Situation | Behavior |
 |---|---|
@@ -147,6 +247,7 @@ Verification must cover:
 - Valid user and service tokens; incorrect signatures, algorithms, issuer, audience, purpose, lifetime, and subject; missing or unsupported group claims.
 - Key rotation, bounded caching, unknown key IDs, issuer outages, and absence of any insecure fallback.
 - Public bootstrap versus protected routes, aliases, programmatic construction, OpenAPI, and authenticated callers with no resource grants.
+- Authentication response envelopes and field types in both modes, including production without the Admin UI, empty groups, explicit nulls, and UTC token expiration.
 - Browser login/renewal/logout, reload behavior, identity changes, and absence of token persistence or logging.
 - Stream expiry while idle, reconnect with fresh credentials, and authorization-driven closure.
 - Token-free private development and VS Code access, plus rejection of caller attempts to enable that mode on a secured deployment.
