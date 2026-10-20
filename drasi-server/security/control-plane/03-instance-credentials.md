@@ -4,7 +4,7 @@
 
 ## Overview
 
-V1 starts with a simple trusted-administrator model. We will expand it only when justified by user demand, not build additional isolation or credential-management machinery in anticipation of it. Backward compatibility, user migration, and data migration are not requirements.
+V1 starts with a simple trusted-administrator model. Host-enabled production discovery, shared host authentication options for Instance Admins, and supported token-target overrides are deliberate simplicity choices. More restrictive controls are deferred until justified by concrete user or scenario demand, not promised for a later version. Backward compatibility, user migration, and data migration are not requirements.
 
 Drasi Server will give each DrasiLib instance its own credential context: one optional Secret Store and multiple named, shared workload identity-provider configurations. Instance Authors and existing Source/Reaction Owners may use the credentials made available to their instance. They are trusted integration developers, not mutually adversarial tenants.
 
@@ -41,6 +41,8 @@ Enabling a chain accepts its documented credential selection and error behavior.
 The host/cloud operator establishes the underlying identity's usability and external permissions. Drasi does not provision cloud identities or grant cloud IAM access. An identity identifier alone is not proof that the deployment can use it.
 
 All Instance Admins may select from the same available host options. There is no per-instance identity allowlist, assignment approval, or uniqueness requirement. Two instances may intentionally use the same identity, external vault, or scope. An administrator may configure a new profile using external authority also used by another instance; this does not grant direct access to that instance's Drasi profiles or components.
+
+Separate profiles or external scopes do not isolate administrators who can select the same host-provided identities. Use separately configured deployments when administrators must not share that external authority.
 
 API Server Admin is not Host Admin. Server Admin may create instances, assign trusted Instance Admins, and administer profiles across instances, but cannot introduce or redefine host authentication options through that API role. Trusted initialization may establish the initial Server Admin Principal/group as specified by administration and authorization.
 
@@ -103,7 +105,7 @@ Each IDP defines its provider-specific settings and uses an available host authe
 
 Retain provider-specific configuration instead of inventing a cross-cloud scope language. Components may supply supported request context, such as a token's target service or a database hostname/port. Context must not replace the selected host authentication option, its identity-selection settings, or a configured assumed role.
 
-For Azure, the configured token scope is a default that supported component context may override, not a Drasi-enforced resource-access boundary. External IAM and destination authorization determine actual permissions. Host/cloud administrators are responsible for appropriate privileges; Instance Admins deliberately expose that usable authority to their Authors.
+For Azure, the configured token scope is a default that supported component context may override, not a Drasi-enforced resource-access boundary. This is token-request context, not permission to change the Secret Store's scope or the administrator-controlled identity settings above. External IAM and destination authorization determine actual permissions. Host/cloud administrators are responsible for appropriate privileges; Instance Admins deliberately expose that usable authority to their Authors.
 
 ## Permissions and exposed operations
 
@@ -214,7 +216,13 @@ The current Server startup/factory paths, SDK config resolver, runtime credentia
 | Provider context and authentication mode | Supported service-specific context works without substituting identity/mechanism/role; unsupported IDP selections are not ignored |
 | Nested credentials, provider errors, properties, logs, and audit | Reject disallowed inputs and expose no credential values, including on failure paths |
 
-Exact REST paths, field names, host-option representation, cloud SDK integration, Rust types, FFI layouts, caching, synchronization, and dependency indexing are implementation choices. They must implement the operation and permission contracts above, not introduce new roles, identity allowlists, credential-binding resources, value-management APIs, or a credential broker.
+Host-option representation, cloud SDK integration, Rust types, FFI layouts, caching, synchronization, and dependency indexing remain implementation choices. They must implement the operation and permission contracts above, not introduce new roles, identity allowlists, credential-binding resources, value-management APIs, or a credential broker.
+
+### API Design
+
+One implementation task must define and document a single shared API contract for provider management and identifier discovery, including HTTP methods, versioned paths, request/response schemas, and error responses. Server, UI, and other clients must use that contract rather than independently inventing interfaces.
+
+These wire details will be settled during implementation, not in this informal specification. The shared contract must preserve the operations, permissions, lifecycle preconditions, and failure behavior defined here; it does not introduce additional policy decisions.
 
 ## Alternatives considered
 
