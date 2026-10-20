@@ -63,6 +63,7 @@ These names define semantic actions, not a requirement for a particular Rust enu
 | `ingest` | Submit events through a Source's supported ingestion operations; no component discovery, reads, or dependency `use` |
 | `consume` | Access a Reaction's application and exposed results, including supported shared application-data mutations |
 | `manage-credentials` | Administer instance credential profiles and their availability, without revealing resolved values or overriding host admission/external IAM |
+| `read-idp-identifiers` | List shared workload IDP identifiers available in the relevant instance; not profile definitions, resolved credential values, or a vault-wide Secret listing |
 | `read-catalog` | Browse available component kinds, configuration schemas, and host-published templates for authorized creation/editing; not live deployment inventory or component configuration |
 
 **`use` and `consume` are not synonymous.** Query Consumer supplies Bob with `use` on Q for a Reaction he is otherwise authorized to create. Reaction Consumer supplies Carol with `consume` on Bob's Dashboard. Carol does not need Bob's input permissions and gains no direct access to Q's API.
@@ -77,7 +78,7 @@ Apply and template deployment enforce the permissions of each underlying operati
 |---|---|---|---|
 | Server Admin | Server | P/G | All applicable actions defined above across instances; exclusively permits instance creation/deletion and Server Admin binding administration |
 | Instance Admin | One instance | P/G | All applicable actions defined above within its instance, including credential profiles and permitted instance/component bindings; no instance creation/deletion or Server Admin binding administration |
-| Instance Author | One instance | P/G | `create` components, `view` all ordinary component summaries in that instance, `read-catalog`, and available credential-identifier discovery |
+| Instance Author | One instance | P/G | `create` components, `view` all ordinary component summaries in that instance, `read-catalog`, and `read-idp-identifiers` |
 | Operator | One component | P/G | `view`, `start`, `stop` |
 | Source User | One Source | P only | `view`, `use` as a Query input |
 | Source Ingestor | One Source | P/G | `ingest` only |
@@ -98,9 +99,9 @@ An authenticated create assigns the creator as the component's sole Owner, wheth
 | Owned component | Authority supplied by ownership |
 |---|---|
 | Every Source, Query, or Reaction | `view`, `read-config`, `read-diagnostics`, `read-bindings`, permitted `manage-bindings`, `update`, `start`, `stop`, `delete`, `reset-state` if exposed, and `read-catalog` for editing |
-| Source | Additionally `use` and supported `ingest`; select available instance credential references |
+| Source | Additionally `use`, supported `ingest`, and `read-idp-identifiers`; select available instance credential references |
 | Query | Additionally `read-results` and `use` |
-| Reaction | Additionally `consume`; select available instance credential references |
+| Reaction | Additionally `consume` and `read-idp-identifiers`; select available instance credential references |
 
 There is no co-ownership, transfer, Owner binding, or ownership-recovery operation. A scoped administrator may maintain an unavailable Owner's component without taking ownership. Different ownership requires a new component.
 
@@ -188,7 +189,7 @@ Removing authoring rights or disabling an IdP account does not automatically ret
 | Parent navigation and graphs | Component-only access permits minimal parent navigation, not sibling counts; show Source-to-Query-to-Reaction links only when both endpoints are visible |
 | Full configuration, diagnostics, binding lists | Owner or scoped admin only; not implied by summary, input `use`, Operator, or data-reading access |
 | Authoring catalogues | Instance Authors, existing component Owners, and scoped admins for permitted creation/editing; login or data/operation roles alone are insufficient |
-| Credential identifiers | Authors and existing Source/Reaction Owners may discover available shared IDP identifiers; administrators manage profile definitions; no vault-wide Secret listing is required |
+| Shared IDP identifiers | Require `read-idp-identifiers` for the relevant instance, supplied by Instance Author, Source/Reaction ownership in that instance, or scoped administration; Query ownership or `read-catalog` alone does not grant it |
 
 A safe summary contains readable ID, type/kind or Query language, permanent Owner, and status. It excludes query text, endpoints, results, credential references, full bindings, and raw errors. Apply the same visibility to lists, counts, graphs, and summary events. Do not expose credential profiles or Secrets as shared graph nodes, edges, or dependency counts.
 
@@ -265,6 +266,7 @@ Implementers must exercise the policy as behavior, not only unit-test role names
 | Group author/admin versus subject-bound input authority | Group-based requests work; background authority needs qualifying direct bindings or ownership |
 | Default routes, composite calls, programmatic Server, plugin listeners | Same exact-target policy; no alternate entry-point bypass |
 | Summary/config/diagnostic/result/catalogue access | Correct projections and denials; no hidden counts, full-config prefetch, payload logs, or credential values |
+| Shared IDP identifier discovery | Authors, scoped admins, and Source/Reaction Owners may list identifiers within their applicable instance scope; Query ownership or `read-catalog` alone is insufficient; no profile definitions, resolved values, or vault-wide Secret listing |
 | Direct Query attach versus Reaction consumption | Reader needs no authoring rights; consumer needs no upstream grants; neither gains the other's direct API authority |
 | Revocation during idle/active streams and cached reads | Affected access ends; unrelated users/pipelines remain authorized; current Owner input loss blocks dependent work |
 | Update, recreation, import, and restart | Sharing persists only across identity-preserving updates; no transferred authority or seed replay |
