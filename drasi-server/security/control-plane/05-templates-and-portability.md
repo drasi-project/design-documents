@@ -203,7 +203,13 @@ Reuse Server resource-validation and mutation services for Apply; template deplo
 
 DrasiLib supplies runtime facilities but does not own this catalog, portable format, or authorization model. The mandatory Server control store and shared security services from 01-04 are prerequisites, not subsystems to reproduce inside a template engine.
 
-Exact REST paths, document field names, parameter syntax, Rust types, revision representation, parsing libraries, UI layout, and synchronization remain implementation choices. Implementers must provide one consistent Server/client contract and the behaviors above, without adding permissions, deployment controllers, or host-management surfaces.
+Rust types, parsing libraries, UI layout, and internal synchronization remain implementation choices. They must preserve the behaviors above without adding permissions, deployment controllers, or host-management surfaces.
+
+### API Design
+
+One implementation task must define and document a single shared API contract for export, Apply/import, and template deployment. It must cover HTTP methods and paths, bundle and parameter schemas, destination revision preconditions, and response fields/status codes for committed, failed, committed-but-incomplete, and unattempted entries, with request/response examples.
+
+Server, UI, and other clients must use that contract rather than independently inventing interfaces. These wire details will be settled during implementation, not in this informal specification, and must preserve the authorization, reference, lifecycle, and partial-completion behavior defined here.
 
 ## Alternatives considered
 
