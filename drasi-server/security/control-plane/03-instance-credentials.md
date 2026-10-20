@@ -34,7 +34,7 @@ Trusted deployment configuration supplies the authentication options available t
 
 An option may select a particular managed/federated identity or explicitly enable a supported SDK discovery chain. The host may offer explicit identities only, discovery only, or both. Drasi must not enable discovery implicitly.
 
-Instance provider and component configuration may reference these options, but must not override their identity-selection settings or enable an authentication mechanism the host has not provided.
+Instance Secret Store and shared IDP configurations may reference these options, but must not override their identity-selection settings or enable an authentication mechanism the host has not provided. Sources and Reactions select typed Secret references or shared IDP references within their own instance; they must not reference host authentication options directly.
 
 Enabling a chain accepts its documented credential selection and error behavior. Environment changes or a different developer login may change the identity it selects without changing a Drasi profile. This is an accepted host-controlled tradeoff, including for production deployments; a selected chain is not a fixed-identity guarantee.
 
