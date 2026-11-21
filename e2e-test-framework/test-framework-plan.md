@@ -1,0 +1,278 @@
+# Test Framework Plan
+
+* Project Drasi — April 29, 2026 — Ruokun Niu (@ruokun-niu)
+
+## Executing the Test Framework
+
+**Runnable manually.** Developers must be able to run the full test suite from their local machine or as a Github Actions workflow (triggered via `workflow_dispatch`). The existing building_comfort examples in the [test-infra](https://github.com/drasi-project/test-infra) repo demonstrate three distinct run patterns. For each, the description below covers both today's behavior and the proposed direction.
+
+- **drasi-lib (in-process).**
+  - *Today:* A single shell script runs the test-service with drasi-lib compiled in — no external processes needed. The script invokes `cargo run --release --manifest-path ./test-service/Cargo.toml -- --config <config.json>` from the `e2e-test-framework` directory. Everything runs in one process.
+  - *Proposed:* drasi-lib is consumed in one of two ways depending on the trigger:
+    - **Release runs.** The `test-run-host` crate depends on the published `drasi-lib` crate from crates.io (pinned to a released version). This exercises the same artifact users consume.
+    - **Source runs.** The ETF consumes drasi-lib via the `drasi-core` git submodule in the `test-infra` repo, with `test-run-host` taking it as a Cargo path dependency. This lets PRs against drasi-core validate changes before any release exists — bump the submodule pointer to test a different revision.
+
+- **Drasi Server (standalone).**
+  - *Today:* A shell script first builds and starts the drasi-server binary (from a sibling `../../drasi-server` directory) with a `server-config.yaml`, waits for its health check, and then starts the test-service with a separate `config.json` that dispatches changes via HTTP or gRPC to the running server. It can use either a prebuilt binary or execute `cargo run` from a `drasi-server` repo. There are four variants of this pattern: http, http adaptive, grpc, and grpc adaptive.
+  - *Proposed:* The drasi-server binary is obtained in one of two ways depending on the trigger:
+    - **Release runs.** The run script pulls a pre-built drasi-server binary from GitHub Releases (or the published Docker image). This exercises the same artifact users consume.
+    - **Source runs.** The run script builds drasi-server from source with `cargo run` against a checked-out `drasi-server` repo (typically a sibling working copy or a checkout pinned by the workflow). This lets PRs against drasi-server validate changes before any release exists.
+
+    In both cases the server config is supplied by the consolidated `config.json` (see "Proposed Changes" below) rather than a separate `server-config.yaml`, and the ETF takes over the start/health-check/stop lifecycle for the server process.
+
+- **Drasi Platform (Kubernetes).**
+  - *Today:* Assumes an already-running Kubernetes cluster (the user supplies the kubeconfig; the example does not provision one). The test-service is deployed as a pod alongside Drasi Platform, and the run script uses `kubectl port-forward` to expose the test-service's API endpoint locally. Tests are then controlled via REST API calls (using `curl` or `.http` files) against that port-forwarded endpoint. Each query container index backend is a separate example directory with its own self-contained config (`query_container_default`, `query_container_memory`, `query_container_redis`, `query_container_rocks`).
+  - *Proposed:* The overall deployment model stays the same (test-service pod + `kubectl port-forward` to its REST API). Two changes: (1) the framework optionally provisions a local kind cluster automatically when no kubeconfig is provided, so runs do not require an already-running cluster — for CI this becomes the default since it needs no external infrastructure; (2) the per-index-backend example directories (`query_container_memory`, `query_container_redis`, `query_container_rocks`, ...) are collapsed into a single test config plus per-backend pattern files (`platform-memory.yaml`, `platform-redis.yaml`, `platform-rocksdb.yaml`). Provisioning and tearing down a managed cluster (e.g., AKS) within a GitHub Actions workflow is possible but adds a lot of complexity, so it is not part of the default flow.
+
+Each example provides both `run_debug.sh` and `run_release.sh` scripts. For CI, the same scripts (or equivalent `workflow_dispatch` triggers) can be used in GitHub Actions.
+
+**Automatable in CI workflows.** The test framework should be executed in automated tests. There are multiple ways to approach this:
+
+- **Triggered via `workflow_dispatch`.** A manually triggered workflow that lets the user select which target mode and variant to run. This is useful for on-demand testing — for example, running the full suite against a specific drasi-server release before cutting a new version, or validating a particular index backend after a related code change.
+
+- **Triggered on pull requests or pushes to `main`.** Running tests automatically on PRs. The trade-off is increased build time. Compiling the test-service (especially for drasi-lib mode, which compiles all of drasi-lib into the binary) and running 100K+ event tests adds significant minutes to each PR check. A practical compromise is to run a smaller, faster subset (e.g., 1K events with memory index) on every PR and reserve the full suite for `workflow_dispatch` or merges to `main`.
+
+- **Scheduled runs (cron).** A nightly or weekly schedule can run the full test suite against the latest `main` of drasi-core, drasi-server and drasi-platform.
+
+
+#### Current Config Structure
+
+Today, each test target has its own completely separate config file with the test logic (data model, queries, etc.) duplicated inside it. 
+
+The core test logic — the BuildingHierarchy model config (seed, change_count, sensor definitions), the query text, and the stop trigger count — is duplicated across every target variant. Adding a new test scenario or modifying an existing one requires updating 3-4 files. The `source_change_dispatchers`, `output_handler`, and `drasi_servers` blocks are the only parts that differ between targets.
+
+#### Proposed Changes
+
+**Collapse the drasi-server YAML into `config.json`.** Looking at the four `drasi_server_*` variants in [`examples/building_comfort`](https://github.com/drasi-project/test-infra/tree/main/e2e-test-framework/examples/building_comfort), the per-variant `drasi_server_config.yaml` files are nearly identical. `apiVersion`, `host`/`port`, `logLevel`, `autoInstallPlugins`/`verifyPlugins`, and `persistConfig` are the same across all of them, and the only meaningful differences are the transport-specific blocks (`plugins`, the `sources[*].kind`/port, and the `reactions[*].kind`/endpoint). Those transport choices are already encoded in `config.json` via `source_change_dispatchers` (e.g., `Http` on port 9000, `Grpc` on port 50051) and the reaction `output_handler`, so the YAML is duplicating information the ETF already owns.
+
+The `drasi_lib` example shows the consolidated pattern we want to land on: the entire engine config (sources, queries, reactions, plus instance-level settings) is embedded inline under a `drasi_lib_instances` block in `config.json`, with no companion YAML required. We can apply the same pattern to drasi-server by introducing a `drasi_server_instances` block in `config.json` that carries the full server config. At run time the ETF either (a) serializes that block to a temporary YAML and passes it to the drasi-server process via `--config`, or (b) extends drasi-server to accept JSON config directly (its config schema is already structurally identical).
+
+An example of what the consolidated `config.json` could look like for the `drasi_server_http` variant:
+
+```json
+{
+  "data_store": {
+    "test_repos": [{
+      "id": "drasi_server_dev_repo",
+      "kind": "LocalStorage",
+      "source_path": "./dev_repo",
+      "local_tests": [{
+        "test_id": "building_comfort",
+        "test_folder": "building_comfort",
+        "sources": [{
+          "test_source_id": "facilities-db",
+          "kind": "Model",
+          "source_change_dispatchers": [
+            { "kind": "Http", "url": "http://localhost", "port": 9000, "timeout_seconds": 60 }
+          ],
+          "model_data_generator": { "kind": "BuildingHierarchy", "change_count": 100000, "seed": 123456789, "...": "..." },
+          "subscribers": [{ "node_id": "default", "query_id": "building-comfort" }]
+        }],
+        "reactions": [{
+          "test_reaction_id": "building-comfort",
+          "output_handler": { "kind": "Http", "port": 9001, "path": "/reaction", "correlation_header": "X-Query-Sequence" },
+          "stop_triggers": [{ "kind": "RecordCount", "record_count": 100000 }]
+        }],
+
+        "drasi_server_instances": [{
+          "test_drasi_server_instance_id": "external-drasi-server",
+          "launch": {
+            "mode": "binary",
+            "binary_path": "../../drasi-server/bin/drasi-server"
+          },
+          "config": {
+            "apiVersion": "drasi.io/v1",
+            "id": "building-comfort-http",
+            "host": "0.0.0.0",
+            "port": 8080,
+            "logLevel": "info",
+            "autoInstallPlugins": true,
+            "verifyPlugins": false,
+            "plugins": [
+              { "ref": "source/http" },
+              { "ref": "reaction/http" }
+            ],
+            "sources": [
+              { "kind": "http", "id": "facilities-db", "autoStart": true, "host": "0.0.0.0", "port": 9000, "timeoutMs": 60000 }
+            ],
+            "queries": [
+              { "id": "building-comfort", "autoStart": true, "queryLanguage": "Cypher", "sources": [{ "sourceId": "facilities-db" }], "query": "MATCH (r:Room) RETURN elementId(r) AS RoomId, r.temperature AS Temperature, r.humidity AS Humidity, r.co2 AS Co2" }
+            ],
+            "reactions": [
+              { "kind": "http", "id": "building-comfort-out", "autoStart": true, "queries": ["building-comfort"], "baseUrl": "http://localhost:9001", "routes": { "building-comfort": { "added": { "method": "POST", "path": "/reaction" }, "updated": { "method": "POST", "path": "/reaction" }, "deleted": { "method": "POST", "path": "/reaction" } } } }
+            ]
+          }
+        }]
+      }]
+    }]
+  },
+  "test_run_host": {
+    "test_runs": [{
+      "test_id": "building_comfort",
+      "test_repo_id": "drasi_server_dev_repo",
+      "test_run_id": "test_run_001",
+      "drasi_server_instances": [{ "test_drasi_server_instance_id": "external-drasi-server", "start_immediately": true }],
+      "sources": [{ "test_source_id": "facilities-db", "start_mode": "auto" }],
+      "reactions": [{ "test_reaction_id": "building-comfort", "start_immediately": true, "output_loggers": [{ "kind": "PerformanceMetrics" }] }]
+    }]
+  }
+}
+```
+
+The `gRPC` variant would only differ in the inner `plugins`/`sources`/`reactions` blocks and the matching `source_change_dispatchers`/`output_handler` kinds. Switching between a pre-built binary and a `cargo run` build is just a change to the `launch` block:
+
+```json
+"launch": {
+  "mode": "cargo",
+  "manifest_path": "../../drasi-server/Cargo.toml",
+  "release": true
+}
+```
+
+The existing `drasi-lib` `config.json` already follows this consolidated pattern, so it stays unchanged — a single `config.json` per test suite. For [`drasi-platform`](https://github.com/drasi-project/test-infra/tree/main/e2e-test-framework/examples/building_comfort/drasi_platform), we keep the existing split: standard Drasi resource YAMLs (`source.yaml`, the per-backend `query_container_*` configs, etc.) are applied to the cluster via `kubectl`/`drasi apply`, and a separate test config drives the ETF pod. Embedding Kubernetes resource manifests inside `config.json` would just reinvent `kubectl apply` and obscure the fact that the platform is being exercised through its real deployment surface.
+
+---
+
+## Hosting Test Configs and Test Data
+
+All test configuration and test data must be publicly accessible without authentication tokens. The ETF's `GitHub` test repo backend fetches files via the GitHub REST API at runtime, which is subject to rate limiting (60 requests/hour unauthenticated, 5,000 with a PAT). This makes it unsuitable for hosting test data that gets pulled repeatedly across test runs and CI jobs. The options are:
+
+- **Local storage in the repo (recommended for configs and small data):** Test configs, Drasi engine configs, and small golden files live directly in the `test-infra` repo. After cloning (or checking out in CI), the ETF uses the `LocalStorage` backend with a relative filesystem path — no API calls, no rate limits. This works well for YAML configs and small expected-result files. Smaller synthetic datasets (generated by model sources with fixed seeds) also fit here since they are produced at runtime and don't need to be stored.
+
+- **Hugging Face Hub (recommended for test data files):** Public datasets on Hugging Face are freely downloadable without authentication and without the rate limiting issues of GitHub's API. Files are accessible via a predictable HTTP URL pattern: `https://huggingface.co/datasets/{org}/{repo}/resolve/main/{path}`. We would create a public dataset repo (e.g., `drasi-project/test-data`) and push JSONL files to it. HF Hub is git-based and automatically uses Git LFS for large files, so versioning is built in. The ETF would download files with a simple HTTP GET to the resolve URL — no special client library needed. This is free, public, requires no infrastructure to maintain, and has no rate limits for normal usage.
+
+The recommended approach is: **test configs and smaller-sized files in the repo** (LocalStorage), **JSONL test data files on Hugging Face Hub** (downloaded via HTTP at test time or pre-cached locally).
+
+---
+
+## Expanding the Test Suite
+
+We need a defined test suite for drasi-platform, drasi-server, and drasi-lib that covers four dimensions: component configurations, query complexities, index configurations, and failure recovery.
+
+### Component Configurations & Query Complexities
+
+The test suite should exercise a variety of source, query, and reaction configurations. The scenarios to cover include:
+
+- Different source and bootstrap types (model-generated synthetic data, script-replayed recorded data) — see [Replace ETF Script Bootstrap with the Drasi `scriptfile` Bootstrap Provider](#replace-etf-script-bootstrap-with-the-drasi-scriptfile-bootstrap-provider)
+- Multi-source queries with synthetic joins
+- Fan-out topologies (one source feeding multiple queries)
+
+### Query Indexes
+
+Each target supports a different set of query index backends.
+
+| Target | Available Index Backends |
+|--------|------------------------|
+| **drasi-platform** | Memory, Redis/Garnet, RocksDB |
+| **drasi-server** | Memory (default), RocksDB |
+| **drasi-lib** | Memory (default), RocksDB, Redis/Garnet |
+
+
+### Failure Recovery
+
+**NOTE:** This might be something to focus on after we have completed all of the resilience-related work
+
+The following scenarios are feasible with the current ETF capabilities or with modest extensions:
+
+- **Source pause and resume.** The ETF already supports `pause`/`start` control on sources via its REST API. A test can dispatch N events, pause the source, verify partial results, resume, and verify the final result matches the full run. This validates that no events are lost during a pause/resume cycle.
+
+- **Query stop and restart.** The ETF supports `stop`/`start` on query observers. For drasi-lib mode, the Drasi engine can also stop and restart a query. A test can process events, stop the query, continue dispatching changes (which the query misses), restart the query (triggering re-bootstrap), and verify the query reaches the correct final state.
+
+- **Server process restart (drasi-server).** In standalone mode, the run script can kill and restart the drasi-server binary between test phases. This requires the run script to orchestrate pause → kill → restart → resume, which is scriptable but not yet automated in the ETF.
+  - **Server process restart with state store (drasi-server).** When a source is configured with a `stateStore` (e.g., `kind: redb`), restarting the server should cause the source to resume from where it left off rather than replaying from the beginning. The ETF can verify this by checking that no duplicate reaction outputs are produced after restart.
+
+- **Reaction stop and restart.** Stop a reaction observer while the query continues producing results, then restart it. The reaction should catch up on any results it missed during the gap. The ETF's reaction control APIs (`stop`/`start`) already support this.
+
+The following scenarios require more significant work or depend on features not yet implemented:
+
+- **Checkpoint-based source replay.** The Source Checkpoints design (documented in `drasi-lib/Source-Checkpoints/`) is not yet fully implemented. Once available, tests can verify that a source restarts from its last checkpoint rather than replaying all events.
+
+### Tracing and Metrics Integration
+
+The ETF supports OtelMetric and OtelTrace loggers that can export telemetry to OpenTelemetry-compatible backends. However, drasi-server and drasi-lib do not yet have structured tracing or metrics instrumentation implemented. A separate design document for adding tracing, logging, and metrics integration to drasi-lib is currently under review at [drasi-project/design-documents#7](https://github.com/drasi-project/design-documents/pull/7). We will revisit this section once that design is reviewed and approved, as it will determine what telemetry signals are available for the test framework to consume and verify.
+
+### Result Reporting
+
+After a test run completes, we need to extract key performance and correctness results in a structured, comparable format. The ETF already provides several logger types that capture data during a run. The question is how to consolidate them into actionable test reports.
+
+#### What the ETF captures today
+
+The ETF's logger system writes output per query and per reaction during a test run:
+
+- **PerformanceMetrics logger** (reaction output) — writes a JSON summary at the end of the run:
+  ```json
+  {
+    "start_time_ns": 1627849200000000000,
+    "end_time_ns": 1627849260000000000,
+    "duration_ns": 60000000000,
+    "record_count": 150000,
+    "records_per_second": 2500.0,
+    "test_run_reaction_id": "repo.test.run001.reaction",
+    "timestamp": "2025-07-31T19:45:00Z"
+  }
+  ```
+
+- **Profiler logger** (query results) — generates detailed profiling data including bootstrap and change processing stats, min/max/avg latencies, and optional visualization images. Outputs to JSONL files with configurable `write_bootstrap_log`, `write_change_log`, and `write_change_image` flags.
+
+- **JsonlFile logger** — writes every query result or reaction output as a JSONL record. This is the raw data needed for correctness verification (comparing against golden files).
+
+- **OtelMetric / OtelTrace loggers** — export to OpenTelemetry-compatible backends (e.g., Prometheus, Jaeger). Useful for live dashboards but not for automated test reporting.
+
+
+#### Proposed reporting approach
+
+After each test run, the ETF (or a post-processing script) should produce a single `test-report.json` that consolidates the key metrics from all loggers into one file. This makes it easy to compare runs, track regressions, and display in CI summaries.
+
+   **Local runs.** The ETF already writes logger output to a `test_data_cache/` directory (configured via `data_store_path`). The `test-report.json` should be written alongside the other logger output in the same run directory — for example, `test_data_cache/<repo>/<test_id>/<run_id>/test-report.json`. This keeps all artifacts for a run co-located and easy to find. Developers can also specify a custom output path via a `--report-output <path>` CLI flag if they want reports written elsewhere.
+
+   **GitHub Actions.** The `test-report.json` is written to the same run output directory within the runner's workspace. A post-run step parses the report and writes a Markdown results table (status, throughput, latency, correctness) into `$GITHUB_STEP_SUMMARY`, which renders directly on the workflow run's Summary tab — visible immediately without downloading anything. The same step uploads the entire run output directory (including `test-report.json`, JSONL logs, and profiler output) as a [build artifact](https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/storing-and-sharing-data-from-a-workflow#uploading-build-and-test-artifacts) using `actions/upload-artifact` for historical tracking and debugging. Build artifacts are retained for 90 days by default and this is configurable.
+
+---
+
+## Additional Notes
+
+### Replace ETF Script Bootstrap with the Drasi `scriptfile` Bootstrap Provider
+
+Today, when a test uses recorded data (as opposed to model-generated data), the ETF handles bootstrapping itself: the `Script` kind source has a `bootstrap_data_generator` that reads script files and dispatches them as source change events through the ETF's dispatchers. This means the ETF is responsible for converting script data into the right format, managing the bootstrap phase, and coordinating the handoff to streaming changes. The Drasi engine (drasi-lib or drasi-server) sees these as regular source change events — it has no awareness that a bootstrap is happening.
+
+Drasi Server and drasi-lib now support a native `scriptfile` bootstrap provider — a Drasi plugin that loads initial data from JSONL files directly during query startup:
+
+```yaml
+# Drasi server-config.yaml or drasi-lib config
+sources:
+  - id: facilities-db
+    source_type: application
+    auto_start: true
+    bootstrapProvider:
+      kind: scriptfile
+      filePaths:
+        - /data/initial_nodes.jsonl
+        - /data/initial_relations.jsonl
+```
+
+The JSONL format uses typed records (`Header`, `Node`, `Relation`, `Finish`). Any source kind can use this bootstrap provider — it decouples bootstrap data loading from the source type.
+
+For drasi-lib and drasi-server tests, we should migrate from the ETF's `Script` bootstrap mechanism to the native `scriptfile` bootstrap provider. This has several advantages:
+
+- **Tests the real bootstrap path.** When users deploy Drasi with a `scriptfile` bootstrap, the query engine loads data through the same code path the test exercises. The current ETF approach tests a synthetic path that no real deployment uses.
+- **Consistent with production.** The `scriptfile` provider handles format parsing, element construction, and bootstrap sequencing. Testing through it validates that pipeline end-to-end.
+
+For drasi-platform (Kubernetes), the `scriptfile` provider is harder to use because the JSONL files need to be accessible from within the pod (e.g., via a ConfigMap, PersistentVolume, or init container). The ETF's current approach of streaming bootstrap data through dispatchers remains more practical for platform tests.
+
+The migration involves:
+1. Converting existing ETF bootstrap script files to the `scriptfile` JSONL format (`Header`, `Node`, `Relation`, `Finish` records)
+2. Adding `bootstrapProvider: { kind: scriptfile, filePaths: [...] }` to the Drasi engine config files (`drasi-memory.yaml`, `server-config.yaml`, etc.)
+3. Removing the `bootstrap_data_generator` block from the ETF's source config for these tests
+4. Hosting the JSONL bootstrap files locally in the repo (for drasi-lib/server) or on Hugging Face Hub (for larger datasets)
+
+### Using Drasi's Mock Source vs ETF Data Generators
+
+Drasi Server and drasi-lib include a built-in Mock source (`kind: mock`) that generates synthetic data internally — `Counter`, `SensorReading`, and `Generic` types. For simple test scenarios that only need single-node data (projections, filters, property updates), the Mock source could replace the ETF's model data generator entirely. This would remove the ETF from the data path, making the test exercise Drasi's own data generation → query → reaction pipeline with nothing in between.
+
+However, the Mock source currently only generates flat node data with no relationships or hierarchical structure. It cannot produce the `Building → Floor → Room` graph with `PART_OF` relationships that is needed for join queries, multi-hop traversals, or aggregations across a hierarchy. For these tests, the ETF's `BuildingHierarchy` model generator (or script-based sources) remains necessary.
+
+If the team wants to reduce dependency on the ETF for data generation, one option would be to extend the Mock source to support relationship generation and hierarchical structures. This is a discussion point for the team — the trade-off is implementation effort in drasi-server/drasi-lib vs the testing simplicity gained by keeping data generation inside the Drasi engine.
+
+
+### Workflow improvement
+- Add the Scorecard and DevSkim workflows to the test-infra repository.
